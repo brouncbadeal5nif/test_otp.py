@@ -841,20 +841,20 @@ async def otp_list_callback(c: CallbackQuery):
         btns = []
 
         for app in res["Result"]:
-        try:
-            cost = float(app.get("Cost", 0))
-        except:
-            cost = 0.0
+            try:
+                cost = float(app.get("Cost", 0))
+            except:
+                cost = 0.0
 
-        sell_price = int(cost * 3000)
-        app_id = int(app["Id"])
+            sell_price = int(cost * 3000)
+            app_id = int(app["Id"])
 
-        btns.append([
-            InlineKeyboardButton(
-                text=f"{app['Name']} [{app_id}] - {sell_price:,}đ",
-                callback_data=f"appinfo|{app_id}|{sell_price}|{app['Name']}"
-            )
-        ])
+            btns.append([
+                InlineKeyboardButton(
+                    text=f"{app['Name']} [{app_id}] - {sell_price:,}đ",
+                    callback_data=f"appinfo|{app_id}|{sell_price}|{app['Name']}"
+                )
+            ])
 
         btns.append([InlineKeyboardButton(text="⬅️ Quay lại", callback_data="menu")])
 
