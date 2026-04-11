@@ -966,7 +966,7 @@ async def buy_back_number(m: Message):
     except:
         cost = 0
 
-    sell_price = float(cost * 3000)
+    sell_price = int(cost * 3000)
     app_name = selected_app.get("Name", f"App {app_id}")
 
     user_id = m.from_user.id
