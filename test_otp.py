@@ -1159,6 +1159,10 @@ async def menu_back(c: CallbackQuery):
     await c.message.edit_text("🏠 <b>Menu</b>", reply_markup=main_menu_keyboard(c.from_user.id))
 
 # --- SEPAY WEBHOOK ---
+def normalize_payment_text(text: str) -> str:
+    if not text:
+        return ""
+    return "".join(ch.lower() for ch in str(text) if ch.isalnum())
 def _flatten_payload(payload):
     if isinstance(payload, dict):
         if isinstance(payload.get("data"), dict):
@@ -1238,13 +1242,19 @@ async def sepay_webhook_post(request: Request):
     orders = get_pending_orders()
     matched = None
 
+    normalized_content = normalize_payment_text(content)
+
     for order in orders:
-        if order["memo"] in content and int(order["amount"]) == int(amount):
+        normalized_memo = normalize_payment_text(order["memo"])
+
+        if normalized_memo in normalized_content and int(order["amount"]) == int(amount):
             matched = order
             break
 
     if not matched:
-        logging.info(f"SEPAY no match | amount={amount} | content={content}")
+        logging.info(
+            f"SEPAY no match | amount={amount} | content={content} | normalized={normalized_content}"
+        )
         return {"ok": True, "message": "no match"}
 
     async with BALANCE_LOCK:
