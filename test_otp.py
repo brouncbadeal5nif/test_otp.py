@@ -62,6 +62,10 @@ QR_PASTE_Y = 500
 QR_PASTE_W = 270
 QR_PASTE_H = 270
 
+# --- REFERRAL ---
+REFERRAL_BONUS = 3000
+BOT_USERNAME_CACHE = None
+
 # --- DANH SÁCH APP CỐ ĐỊNH HIỂN THỊ TRONG BOT ---
 FIXED_APP_LIST = [
     {"Id": 1001, "Name": "Facebook"},
@@ -156,6 +160,20 @@ def init_db():
             raw_payload TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             paid_at TEXT
+        )
+    """)
+
+    # Bảng referral mới, chỉ thêm chứ không đụng bảng cũ
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS referrals(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            referrer_id INTEGER NOT NULL,
+            invited_user_id INTEGER NOT NULL UNIQUE,
+            bonus INTEGER NOT NULL DEFAULT 3000,
+            invited_full_name TEXT,
+            invited_username TEXT,
+            ref_code TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
@@ -320,6 +338,181 @@ def mark_order_paid(order_id: int, transaction_id: str = "", raw_payload: str = 
     finally:
         conn.close()
 
+# --- REFERRAL DATABASE ---
+def get_referral_by_invited(invited_user_id: int):
+    conn = db()
+    try:
+        row = conn.execute("""
+            SELECT * FROM referrals
+            WHERE invited_user_id = ?
+            LIMIT 1
+        """, (invited_user_id,)).fetchone()
+        return row
+    finally:
+        conn.close()
+
+def get_referral_stats(user_id: int):
+    conn = db()
+    try:
+        row = conn.execute("""
+            SELECT
+                COUNT(*) AS total_invited,
+                COALESCE(SUM(bonus), 0) AS total_bonus
+            FROM referrals
+            WHERE referrer_id = ?
+        """, (user_id,)).fetchone()
+
+        total_invited = int(row["total_invited"]) if row else 0
+        total_bonus = int(row["total_bonus"]) if row else 0
+        return total_invited, total_bonus
+    finally:
+        conn.close()
+
+def get_referral_history(user_id: int, limit: int = 20):
+    conn = db()
+    try:
+        rows = conn.execute("""
+            SELECT invited_user_id, invited_full_name, invited_username, bonus, ref_code, created_at
+            FROM referrals
+            WHERE referrer_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+        """, (user_id, limit)).fetchall()
+        return rows
+    finally:
+        conn.close()
+
+def build_ref_code(referrer_id: int) -> str:
+    return f"ref_{referrer_id}"
+
+def extract_referrer_id_from_start(text: str):
+    try:
+        parts = (text or "").split(maxsplit=1)
+        if len(parts) < 2:
+            return None
+
+        payload = parts[1].strip()
+        if not payload.startswith("ref_"):
+            return None
+
+        referrer_id = int(payload.replace("ref_", "", 1))
+        return referrer_id
+    except Exception:
+        return None
+
+def apply_referral_bonus_atomic(referrer_id: int, invited_user, bonus: int = REFERRAL_BONUS):
+    """
+    Kết quả:
+    ("credited", new_balance)
+    ("self_ref", None)
+    ("referrer_not_found", None)
+    ("already_referred", None)
+    ("error", None)
+    """
+    if not referrer_id:
+        return ("error", None)
+
+    if int(referrer_id) == int(invited_user.id):
+        return ("self_ref", None)
+
+    conn = db()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+
+        referrer = cur.execute("""
+            SELECT user_id, full_name, username, balance
+            FROM users
+            WHERE user_id = ?
+            LIMIT 1
+        """, (referrer_id,)).fetchone()
+
+        if not referrer:
+            conn.rollback()
+            return ("referrer_not_found", None)
+
+        existed = cur.execute("""
+            SELECT id FROM referrals
+            WHERE invited_user_id = ?
+            LIMIT 1
+        """, (invited_user.id,)).fetchone()
+
+        if existed:
+            conn.rollback()
+            return ("already_referred", None)
+
+        ref_code = build_ref_code(referrer_id)
+
+        cur.execute("""
+            INSERT INTO referrals(
+                referrer_id,
+                invited_user_id,
+                bonus,
+                invited_full_name,
+                invited_username,
+                ref_code
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            referrer_id,
+            invited_user.id,
+            int(bonus),
+            invited_user.full_name,
+            invited_user.username,
+            ref_code
+        ))
+
+        cur.execute("""
+            UPDATE users
+            SET balance = balance + ?
+            WHERE user_id = ?
+        """, (int(bonus), referrer_id))
+
+        row = cur.execute("""
+            SELECT balance FROM users
+            WHERE user_id = ?
+            LIMIT 1
+        """, (referrer_id,)).fetchone()
+
+        new_balance = int(row["balance"]) if row else 0
+
+        cur.execute("""
+            INSERT INTO balance_logs(user_id, change_amount, balance_after, note)
+            VALUES (?, ?, ?, ?)
+        """, (
+            referrer_id,
+            int(bonus),
+            new_balance,
+            f"Thưởng giới thiệu bạn bè: invited_user_id={invited_user.id}"
+        ))
+
+        conn.commit()
+        return ("credited", new_balance)
+
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        return ("already_referred", None)
+    except Exception:
+        conn.rollback()
+        logging.exception("Lỗi apply_referral_bonus_atomic")
+        return ("error", None)
+    finally:
+        conn.close()
+
+async def get_bot_username_cached():
+    global BOT_USERNAME_CACHE
+    if BOT_USERNAME_CACHE:
+        return BOT_USERNAME_CACHE
+
+    me = await bot.get_me()
+    BOT_USERNAME_CACHE = me.username
+    return BOT_USERNAME_CACHE
+
+async def build_referral_link(referrer_id: int) -> str:
+    username = await get_bot_username_cached()
+    return f"https://t.me/{username}?start={build_ref_code(referrer_id)}"
+
 # --- APP NOTES DATABASE ---
 def set_app_note(keyword, note):
     conn = db()
@@ -468,6 +661,7 @@ def main_menu_keyboard(user_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"💰 Số dư: {bal_text}", callback_data="refresh_bal")],
         [InlineKeyboardButton(text="📱 Thuê số OTP", callback_data="otp_list")],
+        [InlineKeyboardButton(text="🎁 Giới thiệu bạn bè", callback_data="referral_menu")],
         [
             InlineKeyboardButton(text="💳 Nạp tiền", callback_data="deposit"),
             InlineKeyboardButton(text="☎️ Hỗ trợ", callback_data="contact")
@@ -478,8 +672,60 @@ def main_menu_keyboard(user_id):
 @dp.message(Command("start"))
 async def show_menu(m: Message):
     save_user(m.from_user)
+
+    referral_notice = ""
+    referrer_id = extract_referrer_id_from_start(m.text)
+
+    if referrer_id:
+        async with BALANCE_LOCK:
+            status, new_balance = apply_referral_bonus_atomic(
+                referrer_id=referrer_id,
+                invited_user=m.from_user,
+                bonus=REFERRAL_BONUS
+            )
+
+        if status == "credited":
+            referral_notice = (
+                f"\n\n🎉 Link giới thiệu hợp lệ."
+                f"\nNgười giới thiệu đã được cộng <b>{REFERRAL_BONUS:,}đ</b>."
+            )
+
+            try:
+                await bot.send_message(
+                    referrer_id,
+                    "🎁 <b>BẠN VỪA NHẬN HOA HỒNG GIỚI THIỆU</b>\n\n"
+                    f"👤 Người được giới thiệu: <b>{html.escape(m.from_user.full_name)}</b>\n"
+                    f"🆔 ID: <code>{m.from_user.id}</code>\n"
+                    f"💰 Hoa hồng: <b>{REFERRAL_BONUS:,}đ</b>\n"
+                    f"💳 Số dư mới: <b>{new_balance:,}đ</b>"
+                )
+            except Exception:
+                logging.exception("Không gửi được thông báo referral cho referrer")
+
+            try:
+                await bot.send_message(
+                    ADMIN_ID,
+                    "📣 <b>PHÁT SINH REFERRAL MỚI</b>\n\n"
+                    f"👤 Referrer ID: <code>{referrer_id}</code>\n"
+                    f"👥 User mới: <b>{html.escape(m.from_user.full_name)}</b>\n"
+                    f"🆔 Invited ID: <code>{m.from_user.id}</code>\n"
+                    f"💰 Hoa hồng: <b>{REFERRAL_BONUS:,}đ</b>\n"
+                    f"💳 Số dư referrer sau cộng: <b>{new_balance:,}đ</b>"
+                )
+            except Exception:
+                logging.exception("Không gửi được thông báo referral cho admin")
+
+        elif status == "self_ref":
+            referral_notice = "\n\n⚠️ Bạn không thể tự dùng link giới thiệu của chính mình."
+        elif status == "already_referred":
+            referral_notice = "\n\nℹ️ Tài khoản này đã được ghi nhận referral từ trước."
+        elif status == "referrer_not_found":
+            referral_notice = "\n\nℹ️ Link giới thiệu không hợp lệ."
+        else:
+            referral_notice = "\n\n⚠️ Có lỗi khi xử lý giới thiệu, vui lòng thử lại."
+
     await m.answer(
-        f"👋 Chào <b>{m.from_user.full_name}</b>!",
+        f"👋 Chào <b>{html.escape(m.from_user.full_name)}</b>!{referral_notice}",
         reply_markup=main_menu_keyboard(m.from_user.id)
     )
 
@@ -489,18 +735,24 @@ async def help_command(m: Message):
         "<b>📖 Danh sách lệnh</b>\n\n"
         "/start - Mở menu\n"
         "/help - Xem lệnh\n"
-        "/users - Xem danh sách user (admin)\n"
-        "/thongbao [nội dung] - Gửi thông báo (admin)\n"
-        "/sodu [user_id] - Xem số dư 1 user (admin)\n"
-        "/khachdangdu - Xem khách còn dư tiền (admin)\n"
-        "/congtien [user_id] [số_tiền] - Cộng tiền (admin)\n"
-        "/trutien [user_id] [số_tiền] - Trừ tiền (admin)\n"
-        "/setsodu [user_id] [số_dư_mới] - Đặt số dư (admin)\n"
-        "/setnote app | nội dung - Ghi chú app (admin)\n"
-        "/delnote keyword - Xóa ghi chú app (admin)\n"
-        "/notes - Xem tất cả ghi chú (admin)\n"
         "/mualai [ID_App] [Số_điện_thoại] - Mua lại số cũ\n"
-        "/backup - Gửi file shop_bot.db về admin (admin)\n"
+        "\n"
+        "<b>🎁 Referral</b>\n"
+        "Bấm nút 'Giới thiệu bạn bè' trong menu để lấy link mời\n"
+        "\n"
+        "<b>👑 Lệnh admin</b>\n"
+        "/users - Xem danh sách user\n"
+        "/thongbao [nội dung] - Gửi thông báo\n"
+        "/sodu [user_id] - Xem số dư 1 user\n"
+        "/khachdangdu - Xem khách còn dư tiền\n"
+        "/congtien [user_id] [số_tiền] - Cộng tiền\n"
+        "/trutien [user_id] [số_tiền] - Trừ tiền\n"
+        "/setsodu [user_id] [số_dư_mới] - Đặt số dư\n"
+        "/refstats [user_id] - Xem thống kê giới thiệu\n"
+        "/setnote app | nội dung - Ghi chú app\n"
+        "/delnote keyword - Xóa ghi chú app\n"
+        "/notes - Xem tất cả ghi chú\n"
+        "/backup - Gửi file shop_bot.db về admin\n"
     )
 
 @dp.callback_query(F.data == "refresh_bal")
@@ -513,6 +765,31 @@ async def refresh_bal(c: CallbackQuery):
 async def contact_callback(c: CallbackQuery):
     await c.answer()
     await c.message.answer("☎️ Hỗ trợ: liên hệ admin của bot: @tai_khoan_xin")
+
+@dp.callback_query(F.data == "referral_menu")
+async def referral_menu_callback(c: CallbackQuery):
+    save_user(c.from_user)
+
+    total_invited, total_bonus = get_referral_stats(c.from_user.id)
+    ref_link = await build_referral_link(c.from_user.id)
+
+    text = (
+        "<b>🎁 GIỚI THIỆU BẠN BÈ</b>\n\n"
+        f"💰 Hoa hồng mỗi lượt thành công: <b>{REFERRAL_BONUS:,}đ</b>\n"
+        "📌 Điều kiện: người được giới thiệu bấm đúng link của bạn và vào /start\n"
+        "📌 Mỗi tài khoản chỉ được tính thưởng 1 lần\n\n"
+        f"👥 Tổng số người đã giới thiệu: <b>{total_invited}</b>\n"
+        f"💵 Tổng hoa hồng đã nhận: <b>{total_bonus:,}đ</b>\n\n"
+        f"🔗 Link giới thiệu của bạn:\n<code>{html.escape(ref_link)}</code>"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Mở link giới thiệu", url=ref_link)],
+        [InlineKeyboardButton(text="⬅️ Quay lại menu", callback_data="menu")]
+    ])
+
+    await c.message.edit_text(text, reply_markup=kb)
+    await c.answer()
 
 # --- ADMIN HANDLERS ---
 @dp.message(Command("users"))
@@ -614,6 +891,51 @@ async def admin_list_positive_balance(m: Message):
     for u in users:
         res.append(f"- {u['full_name']}: {u['balance']:,}đ")
     await m.answer("\n".join(res))
+
+@dp.message(Command("refstats"))
+async def admin_refstats(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return await m.answer("❌ Bạn không có quyền!")
+
+    parts = m.text.split()
+    if len(parts) < 2:
+        return await m.answer("Sử dụng: /refstats [user_id]")
+
+    try:
+        user_id = int(parts[1])
+    except Exception:
+        return await m.answer("❌ user_id phải là số.")
+
+    user = get_user(user_id)
+    if not user:
+        return await m.answer("❌ Không tìm thấy user này.")
+
+    total_invited, total_bonus = get_referral_stats(user_id)
+    history = get_referral_history(user_id, limit=20)
+
+    lines = [
+        "🎁 <b>THỐNG KÊ REFERRAL</b>",
+        f"👤 User: <b>{html.escape(user['full_name'] or 'Không rõ')}</b>",
+        f"🆔 ID: <code>{user_id}</code>",
+        f"👥 Tổng số người đã giới thiệu: <b>{total_invited}</b>",
+        f"💰 Tổng hoa hồng: <b>{total_bonus:,}đ</b>",
+        "",
+        "<b>🕒 20 lượt gần nhất:</b>"
+    ]
+
+    if not history:
+        lines.append("Chưa có referral nào.")
+    else:
+        for i, row in enumerate(history, 1):
+            invited_name = row["invited_full_name"] or "Không rõ tên"
+            invited_username = f"@{row['invited_username']}" if row["invited_username"] else "không username"
+            lines.append(
+                f"{i}. {html.escape(invited_name)} | {invited_username} | "
+                f"ID <code>{row['invited_user_id']}</code> | "
+                f"+{int(row['bonus']):,}đ | {row['created_at']}"
+            )
+
+    await m.answer("\n".join(lines))
 
 @dp.message(Command("setnote"))
 async def admin_set_note(m: Message):
@@ -962,7 +1284,7 @@ async def app_info_callback(c: CallbackQuery):
         return await c.answer("Lỗi dữ liệu!")
 
     carriers = ["Viettel", "Mobi", "Vina", "VNMB", "ITelecom"]
-    btns = [[InlineKeyboardButton(text="🚀 Mua ngay (Ngẫu nhiên)", callback_data=f"buy|{app_id}|{sell_price}|{app_name}")]]
+    btns = [[InlineKeyboardButton(text="🚀 Mua ngay (Ngẫu nhiên)", callback_data=f"buy|{app_id}|{sell_price}|{app_name}")]]  # noqa
 
     row = []
     for net in carriers:
@@ -1163,6 +1485,7 @@ def normalize_payment_text(text: str) -> str:
     if not text:
         return ""
     return "".join(ch.lower() for ch in str(text) if ch.isalnum())
+
 def _flatten_payload(payload):
     if isinstance(payload, dict):
         if isinstance(payload.get("data"), dict):
