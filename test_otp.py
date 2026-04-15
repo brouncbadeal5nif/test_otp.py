@@ -178,6 +178,12 @@ def init_db():
         )
     """)
 
+    # FIX DB CŨ: nếu bảng referrals đã tồn tại từ trước mà thiếu cột first_bonus_amount
+    cur.execute("PRAGMA table_info(referrals)")
+    referral_columns = [column[1] for column in cur.fetchall()]
+    if referral_columns and 'first_bonus_amount' not in referral_columns:
+        cur.execute("ALTER TABLE referrals ADD COLUMN first_bonus_amount INTEGER NOT NULL DEFAULT 3000")
+
     # Bảng log hoa hồng 10% theo từng lần nạp
     cur.execute("""
         CREATE TABLE IF NOT EXISTS referral_commissions(
