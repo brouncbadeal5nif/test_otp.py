@@ -63,6 +63,7 @@ QR_PASTE_W = 270
 QR_PASTE_H = 270
 
 # --- REFERRAL ---
+REFERRAL_FIRST_BONUS = 3000
 REFERRAL_PERCENT = 0.10
 BOT_USERNAME_CACHE = None
 
@@ -163,7 +164,7 @@ def init_db():
         )
     """)
 
-    # Bảng referral: chỉ lưu ai giới thiệu ai
+    # Bảng referral: lưu ai giới thiệu ai
     cur.execute("""
         CREATE TABLE IF NOT EXISTS referrals(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -172,11 +173,12 @@ def init_db():
             invited_full_name TEXT,
             invited_username TEXT,
             ref_code TEXT,
+            first_bonus_amount INTEGER NOT NULL DEFAULT 3000,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
-    # Bảng log hoa hồng referral theo từng lần nạp
+    # Bảng log hoa hồng 10% theo từng lần nạp
     cur.execute("""
         CREATE TABLE IF NOT EXISTS referral_commissions(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -373,13 +375,22 @@ def get_referral_stats(user_id: int):
         """, (user_id,)).fetchone()
 
         row2 = conn.execute("""
-            SELECT COALESCE(SUM(commission_amount), 0) AS total_bonus
+            SELECT COALESCE(SUM(first_bonus_amount), 0) AS total_first_bonus
+            FROM referrals
+            WHERE referrer_id = ?
+        """, (user_id,)).fetchone()
+
+        row3 = conn.execute("""
+            SELECT COALESCE(SUM(commission_amount), 0) AS total_commission
             FROM referral_commissions
             WHERE referrer_id = ?
         """, (user_id,)).fetchone()
 
         total_invited = int(row1["total_invited"]) if row1 else 0
-        total_bonus = int(row2["total_bonus"]) if row2 else 0
+        total_first_bonus = int(row2["total_first_bonus"]) if row2 else 0
+        total_commission = int(row3["total_commission"]) if row3 else 0
+        total_bonus = total_first_bonus + total_commission
+
         return total_invited, total_bonus
     finally:
         conn.close()
@@ -388,7 +399,7 @@ def get_referral_history(user_id: int, limit: int = 20):
     conn = db()
     try:
         rows = conn.execute("""
-            SELECT invited_user_id, invited_full_name, invited_username, ref_code, created_at
+            SELECT invited_user_id, invited_full_name, invited_username, ref_code, first_bonus_amount, created_at
             FROM referrals
             WHERE referrer_id = ?
             ORDER BY id DESC
@@ -432,13 +443,13 @@ def extract_referrer_id_from_start(text: str):
 
 def register_referral_atomic(referrer_id: int, invited_user):
     """
-    Chỉ ghi nhận quan hệ giới thiệu, chưa cộng tiền.
+    Ghi nhận quan hệ giới thiệu + cộng thưởng người mới 3000đ ngay.
     """
     if not referrer_id:
-        return ("error", None)
+        return ("error", None, 0)
 
     if int(referrer_id) == int(invited_user.id):
-        return ("self_ref", None)
+        return ("self_ref", None, 0)
 
     conn = db()
     cur = conn.cursor()
@@ -455,7 +466,7 @@ def register_referral_atomic(referrer_id: int, invited_user):
 
         if not referrer:
             conn.rollback()
-            return ("referrer_not_found", None)
+            return ("referrer_not_found", None, 0)
 
         existed = cur.execute("""
             SELECT id
@@ -466,7 +477,7 @@ def register_referral_atomic(referrer_id: int, invited_user):
 
         if existed:
             conn.rollback()
-            return ("already_referred", None)
+            return ("already_referred", None, 0)
 
         ref_code = build_ref_code(referrer_id)
 
@@ -476,27 +487,54 @@ def register_referral_atomic(referrer_id: int, invited_user):
                 invited_user_id,
                 invited_full_name,
                 invited_username,
-                ref_code
+                ref_code,
+                first_bonus_amount
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?)
         """, (
             referrer_id,
             invited_user.id,
             invited_user.full_name,
             invited_user.username,
-            ref_code
+            ref_code,
+            REFERRAL_FIRST_BONUS
+        ))
+
+        cur.execute("""
+            UPDATE users
+            SET balance = balance + ?
+            WHERE user_id = ?
+        """, (REFERRAL_FIRST_BONUS, referrer_id))
+
+        row = cur.execute("""
+            SELECT balance
+            FROM users
+            WHERE user_id = ?
+            LIMIT 1
+        """, (referrer_id,)).fetchone()
+
+        new_balance = int(row["balance"]) if row else 0
+
+        cur.execute("""
+            INSERT INTO balance_logs(user_id, change_amount, balance_after, note)
+            VALUES (?, ?, ?, ?)
+        """, (
+            referrer_id,
+            REFERRAL_FIRST_BONUS,
+            new_balance,
+            f"Thưởng giới thiệu người mới: invited_user_id={invited_user.id}"
         ))
 
         conn.commit()
-        return ("registered", None)
+        return ("registered", new_balance, REFERRAL_FIRST_BONUS)
 
     except sqlite3.IntegrityError:
         conn.rollback()
-        return ("already_referred", None)
+        return ("already_referred", None, 0)
     except Exception:
         conn.rollback()
         logging.exception("Lỗi register_referral_atomic")
-        return ("error", None)
+        return ("error", None, 0)
     finally:
         conn.close()
 
@@ -767,25 +805,29 @@ async def show_menu(m: Message):
     referrer_id = extract_referrer_id_from_start(m.text)
 
     if referrer_id:
-        status, _ = register_referral_atomic(
-            referrer_id=referrer_id,
-            invited_user=m.from_user
-        )
+        async with BALANCE_LOCK:
+            status, referrer_new_balance, first_bonus = register_referral_atomic(
+                referrer_id=referrer_id,
+                invited_user=m.from_user
+            )
 
         if status == "registered":
             referral_notice = (
                 "\n\n🎉 Link giới thiệu hợp lệ."
                 "\nTài khoản của bạn đã được ghi nhận người giới thiệu."
-                "\nKhi bạn nạp tiền thành công, người giới thiệu sẽ nhận <b>10%</b> hoa hồng."
+                f"\nNgười giới thiệu đã được cộng ngay <b>{first_bonus:,}đ</b>."
+                "\nKhi bạn nạp tiền thành công, người giới thiệu sẽ tiếp tục nhận <b>10%</b> hoa hồng."
             )
 
             try:
                 await bot.send_message(
                     referrer_id,
-                    "📣 <b>CÓ NGƯỜI DÙNG MỚI QUA LINK GIỚI THIỆU CỦA BẠN</b>\n\n"
+                    "🎁 <b>BẠN VỪA NHẬN THƯỞNG GIỚI THIỆU NGƯỜI MỚI</b>\n\n"
                     f"👤 Người dùng: <b>{html.escape(m.from_user.full_name)}</b>\n"
                     f"🆔 ID: <code>{m.from_user.id}</code>\n"
-                    "💡 Khi người này nạp tiền thành công, bạn sẽ nhận <b>10%</b> hoa hồng."
+                    f"💰 Thưởng người mới: <b>{first_bonus:,}đ</b>\n"
+                    f"💳 Số dư mới: <b>{referrer_new_balance:,}đ</b>\n\n"
+                    "💡 Khi người này nạp tiền thành công, bạn còn nhận thêm <b>10%</b> hoa hồng."
                 )
             except Exception:
                 logging.exception("Không gửi được thông báo referral cho referrer")
@@ -797,7 +839,8 @@ async def show_menu(m: Message):
                     f"👤 Referrer ID: <code>{referrer_id}</code>\n"
                     f"👥 User mới: <b>{html.escape(m.from_user.full_name)}</b>\n"
                     f"🆔 Invited ID: <code>{m.from_user.id}</code>\n"
-                    "💰 Cơ chế thưởng: <b>10% khi user nạp tiền thành công</b>"
+                    f"🎁 Thưởng người mới: <b>{first_bonus:,}đ</b>\n"
+                    "💰 Cơ chế tiếp theo: <b>10% khi user nạp tiền thành công</b>"
                 )
             except Exception:
                 logging.exception("Không gửi được thông báo referral cho admin")
@@ -826,7 +869,8 @@ async def help_command(m: Message):
         "\n"
         "<b>🎁 Referral</b>\n"
         "Bấm nút 'Giới thiệu bạn bè' trong menu để lấy link mời\n"
-        "Người được giới thiệu nạp tiền thành công, bạn nhận 10% hoa hồng\n"
+        f"Người mới vào đúng link: bạn nhận ngay {REFERRAL_FIRST_BONUS:,}đ\n"
+        "Người được giới thiệu nạp tiền thành công, bạn nhận thêm 10% hoa hồng\n"
         "\n"
         "<b>👑 Lệnh admin</b>\n"
         "/users - Xem danh sách user\n"
@@ -863,12 +907,14 @@ async def referral_menu_callback(c: CallbackQuery):
 
     text = (
         "<b>🎁 GIỚI THIỆU BẠN BÈ</b>\n\n"
-        "💰 Hoa hồng: <b>10% số tiền nạp</b>\n"
+        f"🎉 Thưởng người mới: <b>{REFERRAL_FIRST_BONUS:,}đ</b>\n"
+        "💰 Hoa hồng nạp tiền: <b>10% số tiền nạp</b>\n"
         "📌 Điều kiện: người được giới thiệu bấm đúng link của bạn và vào /start\n"
-        "📌 Sau đó khi họ nạp tiền thành công, bạn sẽ nhận 10% hoa hồng\n"
+        f"📌 Ngay khi ghi nhận thành công, bạn nhận <b>{REFERRAL_FIRST_BONUS:,}đ</b>\n"
+        "📌 Sau đó khi họ nạp tiền thành công, bạn tiếp tục nhận 10% hoa hồng\n"
         "📌 Mỗi tài khoản chỉ ghi nhận 1 người giới thiệu\n\n"
         f"👥 Tổng số người đã giới thiệu: <b>{total_invited}</b>\n"
-        f"💵 Tổng hoa hồng đã nhận: <b>{total_bonus:,}đ</b>\n\n"
+        f"💵 Tổng thưởng + hoa hồng đã nhận: <b>{total_bonus:,}đ</b>\n\n"
         f"🔗 Link giới thiệu của bạn:\n<code>{html.escape(ref_link)}</code>"
     )
 
@@ -1008,7 +1054,7 @@ async def admin_refstats(m: Message):
         f"👤 User: <b>{html.escape(user['full_name'] or 'Không rõ')}</b>",
         f"🆔 ID: <code>{user_id}</code>",
         f"👥 Tổng số người đã giới thiệu: <b>{total_invited}</b>",
-        f"💰 Tổng hoa hồng đã nhận: <b>{total_bonus:,}đ</b>",
+        f"💰 Tổng thưởng + hoa hồng đã nhận: <b>{total_bonus:,}đ</b>",
         "",
         "<b>🕒 20 user được giới thiệu gần nhất:</b>"
     ]
@@ -1019,9 +1065,11 @@ async def admin_refstats(m: Message):
         for i, row in enumerate(history, 1):
             invited_name = row["invited_full_name"] or "Không rõ tên"
             invited_username = f"@{row['invited_username']}" if row["invited_username"] else "không username"
+            first_bonus_amount = int(row["first_bonus_amount"]) if row["first_bonus_amount"] else 0
             lines.append(
                 f"{i}. {html.escape(invited_name)} | {invited_username} | "
-                f"ID <code>{row['invited_user_id']}</code> | {row['created_at']}"
+                f"ID <code>{row['invited_user_id']}</code> | "
+                f"Thưởng mới <b>{first_bonus_amount:,}đ</b> | {row['created_at']}"
             )
 
     lines.append("")
