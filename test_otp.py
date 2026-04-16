@@ -65,6 +65,7 @@ QR_PASTE_H = 270
 # --- REFERRAL ---
 REFERRAL_FIRST_BONUS = 1000
 REFERRAL_PERCENT = 0.10
+REFERRAL_MIN_DEPOSIT = 5000
 BOT_USERNAME_CACHE = None
 
 # --- DANH SÁCH APP CỐ ĐỊNH HIỂN THỊ TRONG BOT ---
@@ -173,16 +174,19 @@ def init_db():
             invited_full_name TEXT,
             invited_username TEXT,
             ref_code TEXT,
-            first_bonus_amount INTEGER NOT NULL DEFAULT 3000,
+            first_bonus_amount INTEGER NOT NULL DEFAULT 0,
+            first_bonus_paid INTEGER NOT NULL DEFAULT 0,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
-    # FIX DB CŨ: nếu bảng referrals đã tồn tại từ trước mà thiếu cột first_bonus_amount
+    # FIX DB CŨ: nếu bảng referrals đã tồn tại từ trước mà thiếu cột first_bonus_amount / first_bonus_paid
     cur.execute("PRAGMA table_info(referrals)")
     referral_columns = [column[1] for column in cur.fetchall()]
     if referral_columns and 'first_bonus_amount' not in referral_columns:
-        cur.execute("ALTER TABLE referrals ADD COLUMN first_bonus_amount INTEGER NOT NULL DEFAULT 3000")
+        cur.execute("ALTER TABLE referrals ADD COLUMN first_bonus_amount INTEGER NOT NULL DEFAULT 0")
+    if referral_columns and 'first_bonus_paid' not in referral_columns:
+        cur.execute("ALTER TABLE referrals ADD COLUMN first_bonus_paid INTEGER NOT NULL DEFAULT 0")
 
     # Bảng log hoa hồng 10% theo từng lần nạp
     cur.execute("""
@@ -447,9 +451,11 @@ def extract_referrer_id_from_start(text: str):
     except Exception:
         return None
 
+
 def register_referral_atomic(referrer_id: int, invited_user):
     """
-    Ghi nhận quan hệ giới thiệu + cộng thưởng người mới 3000đ ngay.
+    Chỉ ghi nhận quan hệ giới thiệu, KHÔNG cộng thưởng ngay.
+    Thưởng người mới + hoa hồng chỉ được trả khi user nạp >= REFERRAL_MIN_DEPOSIT.
     """
     if not referrer_id:
         return ("error", None, 0)
@@ -494,45 +500,22 @@ def register_referral_atomic(referrer_id: int, invited_user):
                 invited_full_name,
                 invited_username,
                 ref_code,
-                first_bonus_amount
+                first_bonus_amount,
+                first_bonus_paid
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
             referrer_id,
             invited_user.id,
             invited_user.full_name,
             invited_user.username,
             ref_code,
-            REFERRAL_FIRST_BONUS
-        ))
-
-        cur.execute("""
-            UPDATE users
-            SET balance = balance + ?
-            WHERE user_id = ?
-        """, (REFERRAL_FIRST_BONUS, referrer_id))
-
-        row = cur.execute("""
-            SELECT balance
-            FROM users
-            WHERE user_id = ?
-            LIMIT 1
-        """, (referrer_id,)).fetchone()
-
-        new_balance = int(row["balance"]) if row else 0
-
-        cur.execute("""
-            INSERT INTO balance_logs(user_id, change_amount, balance_after, note)
-            VALUES (?, ?, ?, ?)
-        """, (
-            referrer_id,
-            REFERRAL_FIRST_BONUS,
-            new_balance,
-            f"Thưởng giới thiệu người mới: invited_user_id={invited_user.id}"
+            0,
+            0
         ))
 
         conn.commit()
-        return ("registered", new_balance, REFERRAL_FIRST_BONUS)
+        return ("registered_pending", None, 0)
 
     except sqlite3.IntegrityError:
         conn.rollback()
@@ -544,13 +527,22 @@ def register_referral_atomic(referrer_id: int, invited_user):
     finally:
         conn.close()
 
+
 def apply_referral_commission_atomic(invited_user_id: int, deposit_amount: int, source: str = ""):
     """
-    Khi user được giới thiệu nạp tiền thành công,
-    referrer sẽ nhận 10% số tiền nạp.
+    Chống spam referral:
+    - Chỉ trả thưởng/hh khi người được giới thiệu nạp >= REFERRAL_MIN_DEPOSIT
+    - Thưởng người mới chỉ trả 1 lần duy nhất
+    - Hoa hồng 10% trả cho từng lần nạp đủ điều kiện
     """
     if deposit_amount <= 0:
-        return ("ignored", None, 0, 0)
+        return {
+            "status": "ignored",
+            "referrer_id": None,
+            "commission_amount": 0,
+            "first_bonus_amount": 0,
+            "referrer_new_balance": 0
+        }
 
     conn = db()
     cur = conn.cursor()
@@ -559,7 +551,7 @@ def apply_referral_commission_atomic(invited_user_id: int, deposit_amount: int, 
         cur.execute("BEGIN IMMEDIATE")
 
         ref = cur.execute("""
-            SELECT referrer_id, invited_user_id
+            SELECT referrer_id, invited_user_id, first_bonus_paid
             FROM referrals
             WHERE invited_user_id = ?
             LIMIT 1
@@ -567,14 +559,50 @@ def apply_referral_commission_atomic(invited_user_id: int, deposit_amount: int, 
 
         if not ref:
             conn.rollback()
-            return ("no_referrer", None, 0, 0)
+            return {
+                "status": "no_referrer",
+                "referrer_id": None,
+                "commission_amount": 0,
+                "first_bonus_amount": 0,
+                "referrer_new_balance": 0
+            }
 
         referrer_id = int(ref["referrer_id"])
-        commission = int(deposit_amount * REFERRAL_PERCENT)
 
-        if commission <= 0:
+        if int(deposit_amount) < int(REFERRAL_MIN_DEPOSIT):
             conn.rollback()
-            return ("ignored", referrer_id, 0, 0)
+            return {
+                "status": "deposit_not_enough",
+                "referrer_id": referrer_id,
+                "commission_amount": 0,
+                "first_bonus_amount": 0,
+                "referrer_new_balance": 0
+            }
+
+        commission = int(deposit_amount * REFERRAL_PERCENT)
+        first_bonus_amount = 0
+
+        if int(ref["first_bonus_paid"] or 0) == 0:
+            first_bonus_amount = int(REFERRAL_FIRST_BONUS)
+
+            cur.execute("""
+                UPDATE referrals
+                SET first_bonus_paid = 1,
+                    first_bonus_amount = ?
+                WHERE invited_user_id = ?
+            """, (first_bonus_amount, invited_user_id))
+
+        total_reward = commission + first_bonus_amount
+
+        if total_reward <= 0:
+            conn.rollback()
+            return {
+                "status": "ignored",
+                "referrer_id": referrer_id,
+                "commission_amount": 0,
+                "first_bonus_amount": 0,
+                "referrer_new_balance": 0
+            }
 
         cur.execute("""
             INSERT INTO users (user_id, full_name, username, balance)
@@ -586,7 +614,7 @@ def apply_referral_commission_atomic(invited_user_id: int, deposit_amount: int, 
             UPDATE users
             SET balance = balance + ?
             WHERE user_id = ?
-        """, (commission, referrer_id))
+        """, (total_reward, referrer_id))
 
         row = cur.execute("""
             SELECT balance
@@ -597,40 +625,64 @@ def apply_referral_commission_atomic(invited_user_id: int, deposit_amount: int, 
 
         new_balance = int(row["balance"]) if row else 0
 
-        cur.execute("""
-            INSERT INTO balance_logs(user_id, change_amount, balance_after, note)
-            VALUES (?, ?, ?, ?)
-        """, (
-            referrer_id,
-            commission,
-            new_balance,
-            f"Hoa hồng referral 10% từ user {invited_user_id} nạp {deposit_amount}đ | source={source}"
-        ))
+        if first_bonus_amount > 0:
+            cur.execute("""
+                INSERT INTO balance_logs(user_id, change_amount, balance_after, note)
+                VALUES (?, ?, ?, ?)
+            """, (
+                referrer_id,
+                first_bonus_amount,
+                new_balance,
+                f"Thưởng referral đạt ngưỡng nạp đầu tiên từ user {invited_user_id} nạp {deposit_amount}đ | source={source}"
+            ))
 
-        cur.execute("""
-            INSERT INTO referral_commissions(
+        if commission > 0:
+            cur.execute("""
+                INSERT INTO balance_logs(user_id, change_amount, balance_after, note)
+                VALUES (?, ?, ?, ?)
+            """, (
+                referrer_id,
+                commission,
+                new_balance,
+                f"Hoa hồng referral 10% từ user {invited_user_id} nạp {deposit_amount}đ | source={source}"
+            ))
+
+            cur.execute("""
+                INSERT INTO referral_commissions(
+                    referrer_id,
+                    invited_user_id,
+                    deposit_amount,
+                    commission_amount,
+                    source
+                )
+                VALUES (?, ?, ?, ?, ?)
+            """, (
                 referrer_id,
                 invited_user_id,
                 deposit_amount,
-                commission_amount,
+                commission,
                 source
-            )
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            referrer_id,
-            invited_user_id,
-            deposit_amount,
-            commission,
-            source
-        ))
+            ))
 
         conn.commit()
-        return ("credited", referrer_id, commission, new_balance)
+        return {
+            "status": "credited",
+            "referrer_id": referrer_id,
+            "commission_amount": commission,
+            "first_bonus_amount": first_bonus_amount,
+            "referrer_new_balance": new_balance
+        }
 
     except Exception:
         conn.rollback()
         logging.exception("Lỗi apply_referral_commission_atomic")
-        return ("error", None, 0, 0)
+        return {
+            "status": "error",
+            "referrer_id": None,
+            "commission_amount": 0,
+            "first_bonus_amount": 0,
+            "referrer_new_balance": 0
+        }
     finally:
         conn.close()
 
@@ -817,23 +869,24 @@ async def show_menu(m: Message):
                 invited_user=m.from_user
             )
 
-        if status == "registered":
+        if status == "registered_pending":
             referral_notice = (
                 "\n\n🎉 Link giới thiệu hợp lệ."
                 "\nTài khoản của bạn đã được ghi nhận người giới thiệu."
-                f"\nNgười giới thiệu đã được cộng ngay <b>{first_bonus:,}đ</b>."
-                "\nKhi bạn nạp tiền thành công, người giới thiệu sẽ tiếp tục nhận <b>10%</b> hoa hồng."
+                f"\nNgười giới thiệu sẽ chỉ nhận thưởng khi bạn nạp từ <b>{REFERRAL_MIN_DEPOSIT:,}đ</b> trở lên."
+                "\nKhi đạt điều kiện, họ sẽ nhận <b>thưởng người mới</b> và <b>10% hoa hồng</b>."
             )
 
             try:
                 await bot.send_message(
                     referrer_id,
-                    "🎁 <b>BẠN VỪA NHẬN THƯỞNG GIỚI THIỆU NGƯỜI MỚI</b>\n\n"
+                    "📌 <b>ĐÃ GHI NHẬN 1 REFERRAL MỚI</b>\n\n"
                     f"👤 Người dùng: <b>{html.escape(m.from_user.full_name)}</b>\n"
-                    f"🆔 ID: <code>{m.from_user.id}</code>\n"
-                    f"💰 Thưởng người mới: <b>{first_bonus:,}đ</b>\n"
-                    f"💳 Số dư mới: <b>{referrer_new_balance:,}đ</b>\n\n"
-                    "💡 Khi người này nạp tiền thành công, bạn còn nhận thêm <b>10%</b> hoa hồng."
+                    f"🆔 ID: <code>{m.from_user.id}</code>\n\n"
+                    f"⏳ Chưa cộng thưởng ngay.\n"
+                    f"Người này cần nạp tối thiểu <b>{REFERRAL_MIN_DEPOSIT:,}đ</b> để bạn nhận:"
+                    f"\n- Thưởng người mới: <b>{REFERRAL_FIRST_BONUS:,}đ</b>"
+                    "\n- Hoa hồng: <b>10%</b> tiền nạp"
                 )
             except Exception:
                 logging.exception("Không gửi được thông báo referral cho referrer")
@@ -845,8 +898,7 @@ async def show_menu(m: Message):
                     f"👤 Referrer ID: <code>{referrer_id}</code>\n"
                     f"👥 User mới: <b>{html.escape(m.from_user.full_name)}</b>\n"
                     f"🆔 Invited ID: <code>{m.from_user.id}</code>\n"
-                    f"🎁 Thưởng người mới: <b>{first_bonus:,}đ</b>\n"
-                    "💰 Cơ chế tiếp theo: <b>10% khi user nạp tiền thành công</b>"
+                    f"🛡 Chế độ chống spam: chỉ trả thưởng khi user nạp từ <b>{REFERRAL_MIN_DEPOSIT:,}đ</b> trở lên."
                 )
             except Exception:
                 logging.exception("Không gửi được thông báo referral cho admin")
@@ -875,8 +927,8 @@ async def help_command(m: Message):
         "\n"
         "<b>🎁 Referral</b>\n"
         "Bấm nút 'Giới thiệu bạn bè' trong menu để lấy link mời\n"
-        f"Người mới vào đúng link: bạn nhận ngay {REFERRAL_FIRST_BONUS:,}đ\n"
-        "Người được giới thiệu nạp tiền thành công, bạn nhận thêm 10% hoa hồng\n"
+        f"Người mới vào đúng link chỉ được ghi nhận referral, chưa cộng tiền ngay\n"
+        f"Người được giới thiệu phải nạp từ {REFERRAL_MIN_DEPOSIT:,}đ trở lên thì bạn mới nhận {REFERRAL_FIRST_BONUS:,}đ + 10% hoa hồng\n"
         "\n"
         "<b>👑 Lệnh admin</b>\n"
         "/users - Xem danh sách user\n"
@@ -915,9 +967,10 @@ async def referral_menu_callback(c: CallbackQuery):
         "<b>🎁 GIỚI THIỆU BẠN BÈ</b>\n\n"
         f"🎉 Thưởng người mới: <b>{REFERRAL_FIRST_BONUS:,}đ</b>\n"
         "💰 Hoa hồng nạp tiền: <b>10% số tiền nạp</b>\n"
-        "📌 Điều kiện: người được giới thiệu bấm đúng link của bạn và vào /start\n"
-        f"📌 Ngay khi ghi nhận thành công, bạn nhận <b>{REFERRAL_FIRST_BONUS:,}đ</b>\n"
-        "📌 Sau đó khi họ nạp tiền thành công, bạn tiếp tục nhận 10% hoa hồng\n"
+        "📌 Điều kiện 1: người được giới thiệu phải bấm đúng link của bạn và vào /start\n"
+        f"📌 Điều kiện 2: người đó phải nạp từ <b>{REFERRAL_MIN_DEPOSIT:,}đ</b> trở lên\n"
+        f"📌 Khi đạt điều kiện, bạn nhận <b>{REFERRAL_FIRST_BONUS:,}đ</b> + <b>10%</b> hoa hồng\n"
+        f"📌 Những lần nạp dưới <b>{REFERRAL_MIN_DEPOSIT:,}đ</b> sẽ không tính thưởng referral\n"
         "📌 Mỗi tài khoản chỉ ghi nhận 1 người giới thiệu\n\n"
         f"👥 Tổng số người đã giới thiệu: <b>{total_invited}</b>\n"
         f"💵 Tổng thưởng + hoa hồng đã nhận: <b>{total_bonus:,}đ</b>\n\n"
@@ -1359,7 +1412,7 @@ async def admin_action_handler(c: CallbackQuery):
                 note=f"Duyệt nạp tiền thủ công {amount}đ bởi admin {c.from_user.id}"
             )
 
-            commission_status, referrer_id, commission_amount, referrer_new_balance = apply_referral_commission_atomic(
+            referral_result = apply_referral_commission_atomic(
                 invited_user_id=user_id,
                 deposit_amount=amount,
                 source=f"manual_admin_approve_by_{c.from_user.id}"
@@ -1380,30 +1433,54 @@ async def admin_action_handler(c: CallbackQuery):
         except Exception:
             logging.exception("Không gửi được tin nhắn cộng tiền cho khách")
 
-        if commission_status == "credited" and referrer_id and commission_amount > 0:
+        commission_status = referral_result["status"]
+        referrer_id = referral_result["referrer_id"]
+        commission_amount = referral_result["commission_amount"]
+        first_bonus_amount = referral_result["first_bonus_amount"]
+        referrer_new_balance = referral_result["referrer_new_balance"]
+
+        if commission_status == "credited" and referrer_id:
+            reward_lines = []
+            if first_bonus_amount > 0:
+                reward_lines.append(f"🎉 Thưởng người mới: <b>{first_bonus_amount:,}đ</b>")
+            if commission_amount > 0:
+                reward_lines.append(f"💰 Hoa hồng 10%: <b>{commission_amount:,}đ</b>")
+
             try:
                 await bot.send_message(
                     referrer_id,
-                    "🎁 <b>BẠN VỪA NHẬN HOA HỒNG GIỚI THIỆU</b>\n\n"
+                    "🎁 <b>BẠN VỪA NHẬN THƯỞNG REFERRAL</b>\n\n"
                     f"👤 Người được giới thiệu vừa nạp: <code>{user_id}</code>\n"
                     f"💵 Số tiền nạp: <b>{amount:,}đ</b>\n"
-                    f"💰 Hoa hồng 10%: <b>{commission_amount:,}đ</b>\n"
-                    f"💳 Số dư mới: <b>{referrer_new_balance:,}đ</b>"
+                    + "\n".join(reward_lines)
+                    + f"\n💳 Số dư mới: <b>{referrer_new_balance:,}đ</b>"
                 )
             except Exception:
-                logging.exception("Không gửi được thông báo hoa hồng referral cho referrer")
+                logging.exception("Không gửi được thông báo referral cho referrer")
 
             try:
                 await bot.send_message(
                     ADMIN_ID,
-                    "💸 <b>ĐÃ CỘNG HOA HỒNG REFERRAL</b>\n\n"
+                    "💸 <b>ĐÃ CỘNG THƯỞNG REFERRAL</b>\n\n"
                     f"👤 Referrer: <code>{referrer_id}</code>\n"
                     f"👥 Invited: <code>{user_id}</code>\n"
                     f"💰 Tiền nạp: <b>{amount:,}đ</b>\n"
-                    f"🎁 Hoa hồng: <b>{commission_amount:,}đ</b>"
+                    f"🎉 Thưởng người mới: <b>{first_bonus_amount:,}đ</b>\n"
+                    f"💸 Hoa hồng 10%: <b>{commission_amount:,}đ</b>"
                 )
             except Exception:
-                logging.exception("Không gửi được log hoa hồng cho admin")
+                logging.exception("Không gửi được log referral cho admin")
+        elif commission_status == "deposit_not_enough" and referrer_id:
+            try:
+                await bot.send_message(
+                    referrer_id,
+                    "⏳ <b>REFERRAL CHƯA ĐỦ ĐIỀU KIỆN NHẬN THƯỞNG</b>\n\n"
+                    f"👤 User được giới thiệu: <code>{user_id}</code>\n"
+                    f"💵 Vừa nạp: <b>{amount:,}đ</b>\n"
+                    f"📌 Cần nạp từ <b>{REFERRAL_MIN_DEPOSIT:,}đ</b> trở lên để nhận thưởng."
+                )
+            except Exception:
+                logging.exception("Không gửi được thông báo chưa đủ điều kiện cho referrer")
 
         await c.message.edit_text(
             c.message.text + f"\n\n✅ Đã duyệt tay và cộng {amount:,}đ"
@@ -1783,7 +1860,7 @@ async def sepay_webhook_post(request: Request):
             note=f"SePay auto nạp tiền - memo={matched['memo']} - txn={txn_id}"
         )
 
-        commission_status, referrer_id, commission_amount, referrer_new_balance = apply_referral_commission_atomic(
+        referral_result = apply_referral_commission_atomic(
             invited_user_id=matched["user_id"],
             deposit_amount=matched["amount"],
             source=f"sepay:{txn_id}"
@@ -1815,15 +1892,27 @@ async def sepay_webhook_post(request: Request):
     except Exception:
         logging.exception("Không gửi được thông báo cho admin")
 
-    if commission_status == "credited" and referrer_id and commission_amount > 0:
+    commission_status = referral_result["status"]
+    referrer_id = referral_result["referrer_id"]
+    commission_amount = referral_result["commission_amount"]
+    first_bonus_amount = referral_result["first_bonus_amount"]
+    referrer_new_balance = referral_result["referrer_new_balance"]
+
+    if commission_status == "credited" and referrer_id:
+        reward_lines = []
+        if first_bonus_amount > 0:
+            reward_lines.append(f"🎉 Thưởng người mới: <b>{first_bonus_amount:,}đ</b>")
+        if commission_amount > 0:
+            reward_lines.append(f"💰 Hoa hồng 10%: <b>{commission_amount:,}đ</b>")
+
         try:
             await bot.send_message(
                 referrer_id,
-                "🎁 <b>BẠN VỪA NHẬN HOA HỒNG GIỚI THIỆU</b>\n\n"
+                "🎁 <b>BẠN VỪA NHẬN THƯỞNG REFERRAL</b>\n\n"
                 f"👤 Người được giới thiệu: <code>{matched['user_id']}</code>\n"
                 f"💵 Số tiền nạp: <b>{matched['amount']:,}đ</b>\n"
-                f"💰 Hoa hồng 10%: <b>{commission_amount:,}đ</b>\n"
-                f"💳 Số dư mới: <b>{referrer_new_balance:,}đ</b>"
+                + "\n".join(reward_lines)
+                + f"\n💳 Số dư mới: <b>{referrer_new_balance:,}đ</b>"
             )
         except Exception:
             logging.exception("Không gửi được thông báo referral commission cho referrer")
@@ -1831,15 +1920,27 @@ async def sepay_webhook_post(request: Request):
         try:
             await bot.send_message(
                 ADMIN_ID,
-                "💸 <b>REFERRAL HOA HỒNG TỰ ĐỘNG</b>\n\n"
+                "💸 <b>REFERRAL TỰ ĐỘNG ĐÃ CỘNG THƯỞNG</b>\n\n"
                 f"👤 Referrer: <code>{referrer_id}</code>\n"
                 f"👥 Invited: <code>{matched['user_id']}</code>\n"
                 f"💰 Tiền nạp: <b>{matched['amount']:,}đ</b>\n"
-                f"🎁 Hoa hồng: <b>{commission_amount:,}đ</b>\n"
+                f"🎉 Thưởng người mới: <b>{first_bonus_amount:,}đ</b>\n"
+                f"💸 Hoa hồng 10%: <b>{commission_amount:,}đ</b>\n"
                 f"🏦 Txn: <code>{html.escape(txn_id or 'N/A')}</code>"
             )
         except Exception:
             logging.exception("Không gửi được log referral auto cho admin")
+    elif commission_status == "deposit_not_enough" and referrer_id:
+        try:
+            await bot.send_message(
+                referrer_id,
+                "⏳ <b>REFERRAL CHƯA ĐỦ ĐIỀU KIỆN NHẬN THƯỞNG</b>\n\n"
+                f"👤 User được giới thiệu: <code>{matched['user_id']}</code>\n"
+                f"💵 Vừa nạp: <b>{matched['amount']:,}đ</b>\n"
+                f"📌 Cần nạp từ <b>{REFERRAL_MIN_DEPOSIT:,}đ</b> trở lên để nhận thưởng referral."
+            )
+        except Exception:
+            logging.exception("Không gửi được log chưa đủ điều kiện referral")
 
     return {"ok": True, "message": "processed"}
 
