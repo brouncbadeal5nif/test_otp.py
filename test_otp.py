@@ -1146,6 +1146,54 @@ async def admin_history_help_callback(c: CallbackQuery):
 
 
 # --- ADMIN HANDLERS ---
+@dp.message(Command("lichsu"))
+async def admin_balance_history(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return await m.answer("❌ Bạn không có quyền!")
+
+    parts = m.text.split()
+    if len(parts) < 2:
+        return await m.answer("Sử dụng: /lichsu [user_id]")
+
+    try:
+        user_id = int(parts[1])
+    except Exception:
+        return await m.answer("❌ user_id phải là số.")
+
+    user = get_user(user_id)
+    if not user:
+        return await m.answer("❌ Không tìm thấy user này.")
+
+    rows = get_balance_history(user_id, limit=20)
+    if not rows:
+        return await m.answer(
+            f"🧾 <b>LỊCH SỬ SỐ DƯ</b>\n\n"
+            f"👤 User: <b>{html.escape(user['full_name'] or 'Không rõ')}</b>\n"
+            f"🆔 ID: <code>{user_id}</code>\n\n"
+            "Chưa có biến động số dư nào."
+        )
+
+    lines = [
+        "🧾 <b>LỊCH SỬ BIẾN ĐỘNG SỐ DƯ</b>",
+        f"👤 User: <b>{html.escape(user['full_name'] or 'Không rõ')}</b>",
+        f"🆔 ID: <code>{user_id}</code>",
+        ""
+    ]
+
+    for i, row in enumerate(rows, 1):
+        change_amount = int(row["change_amount"] or 0)
+        balance_after = int(row["balance_after"] or 0)
+        note = html.escape(row["note"] or "Không có ghi chú")
+
+        sign = "+" if change_amount >= 0 else ""
+        lines.append(
+            f"{i}. Biến động: <b>{sign}{change_amount:,}đ</b>\n"
+            f"   Số dư sau: <b>{balance_after:,}đ</b>\n"
+            f"   Ghi chú: {note}\n"
+            f"   Thời gian: {row['created_at']}\n"
+        )
+
+    await m.answer("\n".join(lines))
 @dp.message(Command("users"))
 async def admin_list_users(m: Message):
     if m.from_user.id != ADMIN_ID:
