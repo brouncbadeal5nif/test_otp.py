@@ -65,6 +65,7 @@ QR_PASTE_H = 270
 # --- REFERRAL ---
 REFERRAL_FIRST_BONUS = 3000
 REFERRAL_PERCENT = 0.10
+REFERRAL_MIN_DEPOSIT = 20000
 BOT_USERNAME_CACHE = None
 QR_EXPIRE_MINUTES = 30
 
@@ -174,16 +175,19 @@ def init_db():
             invited_full_name TEXT,
             invited_username TEXT,
             ref_code TEXT,
-            first_bonus_amount INTEGER NOT NULL DEFAULT 3000,
+            first_bonus_amount INTEGER NOT NULL DEFAULT 0,
+            first_bonus_paid INTEGER NOT NULL DEFAULT 0,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
-    # FIX DB CŨ: nếu bảng referrals đã tồn tại từ trước mà thiếu cột first_bonus_amount
+    # FIX DB CŨ: nếu bảng referrals đã tồn tại từ trước mà thiếu cột first_bonus_amount / first_bonus_paid
     cur.execute("PRAGMA table_info(referrals)")
     referral_columns = [column[1] for column in cur.fetchall()]
     if referral_columns and 'first_bonus_amount' not in referral_columns:
-        cur.execute("ALTER TABLE referrals ADD COLUMN first_bonus_amount INTEGER NOT NULL DEFAULT 3000")
+        cur.execute("ALTER TABLE referrals ADD COLUMN first_bonus_amount INTEGER NOT NULL DEFAULT 0")
+    if referral_columns and 'first_bonus_paid' not in referral_columns:
+        cur.execute("ALTER TABLE referrals ADD COLUMN first_bonus_paid INTEGER NOT NULL DEFAULT 0")
 
     # Bảng log hoa hồng 10% theo từng lần nạp
     cur.execute("""
@@ -535,7 +539,8 @@ def extract_referrer_id_from_start(text: str):
 
 def register_referral_atomic(referrer_id: int, invited_user):
     """
-    Ghi nhận quan hệ giới thiệu + cộng thưởng người mới 3000đ ngay.
+    Chỉ ghi nhận quan hệ giới thiệu, KHÔNG cộng thưởng ngay.
+    Thưởng người mới + hoa hồng chỉ được trả khi user nạp >= REFERRAL_MIN_DEPOSIT.
     """
     if not referrer_id:
         return ("error", None, 0)
@@ -580,45 +585,22 @@ def register_referral_atomic(referrer_id: int, invited_user):
                 invited_full_name,
                 invited_username,
                 ref_code,
-                first_bonus_amount
+                first_bonus_amount,
+                first_bonus_paid
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
             referrer_id,
             invited_user.id,
             invited_user.full_name,
             invited_user.username,
             ref_code,
-            REFERRAL_FIRST_BONUS
-        ))
-
-        cur.execute("""
-            UPDATE users
-            SET balance = balance + ?
-            WHERE user_id = ?
-        """, (REFERRAL_FIRST_BONUS, referrer_id))
-
-        row = cur.execute("""
-            SELECT balance
-            FROM users
-            WHERE user_id = ?
-            LIMIT 1
-        """, (referrer_id,)).fetchone()
-
-        new_balance = int(row["balance"]) if row else 0
-
-        cur.execute("""
-            INSERT INTO balance_logs(user_id, change_amount, balance_after, note)
-            VALUES (?, ?, ?, ?)
-        """, (
-            referrer_id,
-            REFERRAL_FIRST_BONUS,
-            new_balance,
-            f"Thưởng giới thiệu người mới: invited_user_id={invited_user.id}"
+            0,
+            0
         ))
 
         conn.commit()
-        return ("registered", new_balance, REFERRAL_FIRST_BONUS)
+        return ("registered_pending", None, 0)
 
     except sqlite3.IntegrityError:
         conn.rollback()
@@ -630,13 +612,22 @@ def register_referral_atomic(referrer_id: int, invited_user):
     finally:
         conn.close()
 
+
 def apply_referral_commission_atomic(invited_user_id: int, deposit_amount: int, source: str = ""):
     """
-    Khi user được giới thiệu nạp tiền thành công,
-    referrer sẽ nhận 10% số tiền nạp.
+    Chống spam referral:
+    - Chỉ trả thưởng/hh khi người được giới thiệu nạp >= REFERRAL_MIN_DEPOSIT
+    - Thưởng người mới chỉ trả 1 lần duy nhất
+    - Hoa hồng 10% trả cho từng lần nạp đủ điều kiện
     """
     if deposit_amount <= 0:
-        return ("ignored", None, 0, 0)
+        return {
+            "status": "ignored",
+            "referrer_id": None,
+            "commission_amount": 0,
+            "first_bonus_amount": 0,
+            "referrer_new_balance": 0
+        }
 
     conn = db()
     cur = conn.cursor()
@@ -645,7 +636,7 @@ def apply_referral_commission_atomic(invited_user_id: int, deposit_amount: int, 
         cur.execute("BEGIN IMMEDIATE")
 
         ref = cur.execute("""
-            SELECT referrer_id, invited_user_id
+            SELECT referrer_id, invited_user_id, first_bonus_paid
             FROM referrals
             WHERE invited_user_id = ?
             LIMIT 1
@@ -653,14 +644,49 @@ def apply_referral_commission_atomic(invited_user_id: int, deposit_amount: int, 
 
         if not ref:
             conn.rollback()
-            return ("no_referrer", None, 0, 0)
+            return {
+                "status": "no_referrer",
+                "referrer_id": None,
+                "commission_amount": 0,
+                "first_bonus_amount": 0,
+                "referrer_new_balance": 0
+            }
 
         referrer_id = int(ref["referrer_id"])
-        commission = int(deposit_amount * REFERRAL_PERCENT)
 
-        if commission <= 0:
+        if int(deposit_amount) < int(REFERRAL_MIN_DEPOSIT):
             conn.rollback()
-            return ("ignored", referrer_id, 0, 0)
+            return {
+                "status": "deposit_not_enough",
+                "referrer_id": referrer_id,
+                "commission_amount": 0,
+                "first_bonus_amount": 0,
+                "referrer_new_balance": 0
+            }
+
+        commission = int(deposit_amount * REFERRAL_PERCENT)
+        first_bonus_amount = 0
+
+        if int(ref["first_bonus_paid"] or 0) == 0:
+            first_bonus_amount = int(REFERRAL_FIRST_BONUS)
+            cur.execute("""
+                UPDATE referrals
+                SET first_bonus_paid = 1,
+                    first_bonus_amount = ?
+                WHERE invited_user_id = ?
+            """, (first_bonus_amount, invited_user_id))
+
+        total_reward = commission + first_bonus_amount
+
+        if total_reward <= 0:
+            conn.rollback()
+            return {
+                "status": "ignored",
+                "referrer_id": referrer_id,
+                "commission_amount": 0,
+                "first_bonus_amount": 0,
+                "referrer_new_balance": 0
+            }
 
         cur.execute("""
             INSERT INTO users (user_id, full_name, username, balance)
@@ -672,7 +698,7 @@ def apply_referral_commission_atomic(invited_user_id: int, deposit_amount: int, 
             UPDATE users
             SET balance = balance + ?
             WHERE user_id = ?
-        """, (commission, referrer_id))
+        """, (total_reward, referrer_id))
 
         row = cur.execute("""
             SELECT balance
@@ -683,40 +709,64 @@ def apply_referral_commission_atomic(invited_user_id: int, deposit_amount: int, 
 
         new_balance = int(row["balance"]) if row else 0
 
-        cur.execute("""
-            INSERT INTO balance_logs(user_id, change_amount, balance_after, note)
-            VALUES (?, ?, ?, ?)
-        """, (
-            referrer_id,
-            commission,
-            new_balance,
-            f"Hoa hồng referral 10% từ user {invited_user_id} nạp {deposit_amount}đ | source={source}"
-        ))
+        if first_bonus_amount > 0:
+            cur.execute("""
+                INSERT INTO balance_logs(user_id, change_amount, balance_after, note)
+                VALUES (?, ?, ?, ?)
+            """, (
+                referrer_id,
+                first_bonus_amount,
+                new_balance,
+                f"Thưởng referral đạt ngưỡng nạp đầu tiên từ user {invited_user_id} nạp {deposit_amount}đ | source={source}"
+            ))
 
-        cur.execute("""
-            INSERT INTO referral_commissions(
+        if commission > 0:
+            cur.execute("""
+                INSERT INTO balance_logs(user_id, change_amount, balance_after, note)
+                VALUES (?, ?, ?, ?)
+            """, (
+                referrer_id,
+                commission,
+                new_balance,
+                f"Hoa hồng referral 10% từ user {invited_user_id} nạp {deposit_amount}đ | source={source}"
+            ))
+
+            cur.execute("""
+                INSERT INTO referral_commissions(
+                    referrer_id,
+                    invited_user_id,
+                    deposit_amount,
+                    commission_amount,
+                    source
+                )
+                VALUES (?, ?, ?, ?, ?)
+            """, (
                 referrer_id,
                 invited_user_id,
                 deposit_amount,
-                commission_amount,
+                commission,
                 source
-            )
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            referrer_id,
-            invited_user_id,
-            deposit_amount,
-            commission,
-            source
-        ))
+            ))
 
         conn.commit()
-        return ("credited", referrer_id, commission, new_balance)
+        return {
+            "status": "credited",
+            "referrer_id": referrer_id,
+            "commission_amount": commission,
+            "first_bonus_amount": first_bonus_amount,
+            "referrer_new_balance": new_balance
+        }
 
     except Exception:
         conn.rollback()
         logging.exception("Lỗi apply_referral_commission_atomic")
-        return ("error", None, 0, 0)
+        return {
+            "status": "error",
+            "referrer_id": None,
+            "commission_amount": 0,
+            "first_bonus_amount": 0,
+            "referrer_new_balance": 0
+        }
     finally:
         conn.close()
 
@@ -2205,7 +2255,7 @@ async def sepay_webhook_post(request: Request):
             note=f"SePay auto nạp tiền - order={matched['id']} - memo={matched['memo']} - txn={txn_id}"
         )
 
-        commission_status, referrer_id, commission_amount, referrer_new_balance = apply_referral_commission_atomic(
+        referral_result = apply_referral_commission_atomic(
             invited_user_id=matched["user_id"],
             deposit_amount=matched["amount"],
             source=f"sepay:{txn_id}"
