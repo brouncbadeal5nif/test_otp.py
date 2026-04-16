@@ -66,6 +66,7 @@ QR_PASTE_H = 270
 REFERRAL_FIRST_BONUS = 3000
 REFERRAL_PERCENT = 0.10
 BOT_USERNAME_CACHE = None
+QR_EXPIRE_MINUTES = 30
 
 # --- DANH SÁCH APP CỐ ĐỊNH HIỂN THỊ TRONG BOT ---
 FIXED_APP_LIST = [
@@ -322,13 +323,98 @@ def get_users_with_balance():
 def create_deposit_order(user_id: int, amount: int, memo: str):
     conn = db()
     try:
-        conn.execute("""
+        cur = conn.cursor()
+        cur.execute("""
             INSERT INTO deposit_orders(user_id, amount, memo, status, provider)
             VALUES (?, ?, ?, 'pending', 'sepay')
         """, (user_id, amount, memo))
         conn.commit()
+        return cur.lastrowid
     finally:
         conn.close()
+
+def get_deposit_order_by_id(order_id: int):
+    conn = db()
+    try:
+        row = conn.execute("""
+            SELECT * FROM deposit_orders
+            WHERE id = ?
+            LIMIT 1
+        """, (order_id,)).fetchone()
+        return row
+    finally:
+        conn.close()
+
+def expire_old_pending_orders(minutes: int = QR_EXPIRE_MINUTES):
+    conn = db()
+    try:
+        conn.execute("""
+            UPDATE deposit_orders
+            SET status = 'expired'
+            WHERE status = 'pending'
+              AND datetime(created_at, '+' || ? || ' minutes') <= datetime('now')
+        """, (minutes,))
+        conn.commit()
+    finally:
+        conn.close()
+
+def is_order_expired(order_row, minutes: int = QR_EXPIRE_MINUTES):
+    conn = db()
+    try:
+        row = conn.execute("""
+            SELECT CASE
+                WHEN datetime(?, '+' || ? || ' minutes') <= datetime('now') THEN 1
+                ELSE 0
+            END AS expired
+        """, (order_row['created_at'], minutes)).fetchone()
+        return bool(row['expired']) if row else False
+    finally:
+        conn.close()
+
+def mark_order_expired(order_id: int):
+    conn = db()
+    try:
+        conn.execute("""
+            UPDATE deposit_orders
+            SET status = 'expired'
+            WHERE id = ? AND status = 'pending'
+        """, (order_id,))
+        conn.commit()
+        return conn.total_changes > 0
+    finally:
+        conn.close()
+
+def mark_order_rejected(order_id: int):
+    conn = db()
+    try:
+        conn.execute("""
+            UPDATE deposit_orders
+            SET status = 'rejected'
+            WHERE id = ? AND status = 'pending'
+        """, (order_id,))
+        conn.commit()
+        return conn.total_changes > 0
+    finally:
+        conn.close()
+
+async def auto_expire_deposit_order_later(order_id: int, user_id: int, amount: int, memo: str):
+    await asyncio.sleep(QR_EXPIRE_MINUTES * 60)
+    try:
+        expired = mark_order_expired(order_id)
+        if not expired:
+            return
+        try:
+            await bot.send_message(
+                user_id,
+                f"⏰ Mã QR nạp tiền đã hết hạn sau <b>{QR_EXPIRE_MINUTES} phút</b>.\n"
+                f"💰 Số tiền: <b>{amount:,}đ</b>\n"
+                f"📝 Nội dung cũ: <code>{memo}</code>\n\n"
+                "Vui lòng tạo lại mã QR mới nếu bạn vẫn muốn nạp tiền."
+            )
+        except Exception:
+            logging.exception("Không gửi được thông báo hết hạn QR cho khách")
+    except Exception:
+        logging.exception("Lỗi auto_expire_deposit_order_later")
 
 def get_pending_orders():
     conn = db()
@@ -823,7 +909,7 @@ def get_revenue_stats():
             WHERE status = 'paid'
               AND strftime('%Y-%m', COALESCE(paid_at, created_at), '+7 hours') = strftime('%Y-%m', 'now', '+7 hours')
         """).fetchone()["s"]
-        total_referral_paid = conn.execute("SELECT COALESCE(SUM(first_bonus_amount), 0) AS s FROM referrals WHERE first_bonus_paid = 1").fetchone()["s"]
+        total_referral_paid = conn.execute("SELECT COALESCE(SUM(first_bonus_amount), 0) AS s FROM referrals").fetchone()["s"]
         total_referral_commission = conn.execute("SELECT COALESCE(SUM(commission_amount), 0) AS s FROM referral_commissions").fetchone()["s"]
         return {
             'total_users': int(total_users or 0),
@@ -1535,8 +1621,10 @@ async def deposit_amount_received(m: Message, state: FSMContext):
     amount = int(m.text)
     await state.clear()
 
+    expire_old_pending_orders()
+
     memo = f"NAP{m.from_user.id}_{int(datetime.now().timestamp())}"
-    create_deposit_order(m.from_user.id, amount, memo)
+    order_id = create_deposit_order(m.from_user.id, amount, memo)
 
     qr_url = (
         f"https://img.vietqr.io/image/"
@@ -1548,28 +1636,32 @@ async def deposit_amount_received(m: Message, state: FSMContext):
         f"💰 Số tiền: {amount:,}đ\n"
         f"🏦 STK: <code>{BANK_ACCOUNT}</code>\n"
         f"👤 Chủ TK: <b>{ACCOUNT_NAME}</b>\n"
-        f"📝 Nội dung CK: <code>{memo}</code>\n\n"
+        f"📝 Nội dung CK: <code>{memo}</code>\n"
+        f"🧾 Mã đơn: <code>{order_id}</code>\n"
+        f"⏰ Mã QR có hiệu lực trong <b>{QR_EXPIRE_MINUTES} phút</b>.\n\n"
         f"Vui lòng quét mã QR để thanh toán.\n"
-        f"Hệ thống sẽ tự cộng tiền khi SePay nhận được giao dịch khớp nội dung và số tiền."
+        f"Hết {QR_EXPIRE_MINUTES} phút mà chưa thanh toán, đơn sẽ tự hủy và cần tạo mã mới."
     )
 
     admin_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
             text="✅ Duyệt tay",
-            callback_data=f"admin_approve|{m.from_user.id}|{amount}"
+            callback_data=f"admin_approve|{order_id}"
         ),
         InlineKeyboardButton(
             text="❌ Hủy",
-            callback_data=f"admin_reject|{m.from_user.id}|{amount}"
+            callback_data=f"admin_reject|{order_id}"
         )
     ]])
 
     admin_caption = (
         f"💳 <b>YÊU CẦU NẠP TIỀN</b>\n\n"
+        f"🧾 Order ID: <code>{order_id}</code>\n"
         f"👤 Khách: {m.from_user.full_name}\n"
         f"🆔 ID: <code>{m.from_user.id}</code>\n"
         f"💰 Số tiền: <b>{amount:,}đ</b>\n"
         f"📝 Nội dung CK: <code>{memo}</code>\n"
+        f"⏰ Hết hạn sau: <b>{QR_EXPIRE_MINUTES} phút</b>\n"
         f"🤖 Bot đã lưu đơn chờ SePay tự duyệt."
     )
 
@@ -1589,7 +1681,9 @@ async def deposit_amount_received(m: Message, state: FSMContext):
             f"Bạn vẫn có thể chuyển khoản thủ công:\n"
             f"🏦 STK: <code>{BANK_ACCOUNT}</code>\n"
             f"👤 Chủ TK: <b>{ACCOUNT_NAME}</b>\n"
-            f"📝 Nội dung CK: <code>{memo}</code>"
+            f"📝 Nội dung CK: <code>{memo}</code>\n"
+            f"🧾 Mã đơn: <code>{order_id}</code>\n"
+            f"⏰ Đơn có hiệu lực trong <b>{QR_EXPIRE_MINUTES} phút</b>."
         )
 
     try:
@@ -1601,29 +1695,70 @@ async def deposit_amount_received(m: Message, state: FSMContext):
     except Exception:
         logging.exception("Không gửi được thông báo duyệt nạp tiền cho admin")
 
+    asyncio.create_task(auto_expire_deposit_order_later(order_id, m.from_user.id, amount, memo))
+
 @dp.callback_query(F.data.startswith("admin_"))
 async def admin_action_handler(c: CallbackQuery):
     if c.from_user.id != ADMIN_ID:
         return await c.answer("❌ Bạn không có quyền.", show_alert=True)
 
+    expire_old_pending_orders()
+
     parts = c.data.split("|")
     action = parts[0]
 
+    if len(parts) < 2:
+        return await c.answer("❌ Dữ liệu không hợp lệ.", show_alert=True)
+
+    try:
+        order_id = int(parts[1])
+    except Exception:
+        return await c.answer("❌ Order ID không hợp lệ.", show_alert=True)
+
+    order = get_deposit_order_by_id(order_id)
+    if not order:
+        return await c.answer("❌ Không tìm thấy đơn nạp.", show_alert=True)
+
     if action == "admin_approve":
-        user_id = int(parts[1])
-        amount = int(parts[2])
+        if order["status"] != "pending":
+            return await c.answer(f"❌ Đơn này đã ở trạng thái: {order['status']}", show_alert=True)
+
+        if is_order_expired(order):
+            mark_order_expired(order_id)
+            try:
+                await bot.send_message(
+                    order["user_id"],
+                    f"⏰ Đơn nạp <code>{order_id}</code> đã hết hạn sau <b>{QR_EXPIRE_MINUTES} phút</b>, nên admin không thể duyệt nữa.\n"
+                    "Vui lòng tạo mã QR mới nếu bạn vẫn muốn nạp tiền."
+                )
+            except Exception:
+                logging.exception("Không gửi được thông báo đơn hết hạn cho khách")
+            await c.message.edit_text(c.message.text + f"\n\n⏰ Đơn {order_id} đã hết hạn, không thể duyệt.")
+            return await c.answer("Đơn đã hết hạn!", show_alert=True)
+
+        user_id = int(order["user_id"])
+        amount = int(order["amount"])
 
         async with BALANCE_LOCK:
+            updated = mark_order_paid(
+                order_id,
+                transaction_id=f"manual_admin_{c.from_user.id}",
+                raw_payload=f"manual approve by {c.from_user.id}"
+            )
+
+            if not updated:
+                return await c.answer("❌ Đơn không còn ở trạng thái chờ.", show_alert=True)
+
             new_balance = update_balance(
                 user_id,
                 amount,
-                note=f"Duyệt nạp tiền thủ công {amount}đ bởi admin {c.from_user.id}"
+                note=f"Duyệt nạp tiền thủ công order {order_id} số tiền {amount}đ bởi admin {c.from_user.id}"
             )
 
             commission_status, referrer_id, commission_amount, referrer_new_balance = apply_referral_commission_atomic(
                 invited_user_id=user_id,
                 deposit_amount=amount,
-                source=f"manual_admin_approve_by_{c.from_user.id}"
+                source=f"manual_admin_approve_order_{order_id}_by_{c.from_user.id}"
             )
 
         if new_balance is None:
@@ -1636,6 +1771,7 @@ async def admin_action_handler(c: CallbackQuery):
             await bot.send_message(
                 user_id,
                 f"✅ Bạn đã được cộng <b>{amount:,}đ</b> vào số dư.\n"
+                f"🧾 Order ID: <code>{order_id}</code>\n"
                 f"💰 Số dư mới: <b>{new_balance:,}đ</b>"
             )
         except Exception:
@@ -1667,26 +1803,38 @@ async def admin_action_handler(c: CallbackQuery):
                 logging.exception("Không gửi được log hoa hồng cho admin")
 
         await c.message.edit_text(
-            c.message.text + f"\n\n✅ Đã duyệt tay và cộng {amount:,}đ"
+            c.message.text + f"\n\n✅ Đã duyệt tay order <code>{order_id}</code> và cộng {amount:,}đ"
         )
         await c.answer("Đã duyệt.")
 
     elif action == "admin_reject":
-        user_id = int(parts[1])
-        amount = int(parts[2])
+        if order["status"] != "pending":
+            return await c.answer(f"❌ Đơn này đã ở trạng thái: {order['status']}", show_alert=True)
+
+        if is_order_expired(order):
+            mark_order_expired(order_id)
+            await c.message.edit_text(c.message.text + f"\n\n⏰ Đơn {order_id} đã hết hạn.")
+            return await c.answer("Đơn đã hết hạn!", show_alert=True)
+
+        rejected = mark_order_rejected(order_id)
+        if not rejected:
+            return await c.answer("❌ Không hủy được đơn.", show_alert=True)
+
+        user_id = int(order["user_id"])
+        amount = int(order["amount"])
 
         try:
             await bot.send_message(
                 user_id,
-                f"❌ Yêu cầu nạp <b>{amount:,}đ</b> chưa được duyệt. Vui lòng liên hệ admin nếu cần."
+                f"❌ Yêu cầu nạp <b>{amount:,}đ</b> với đơn <code>{order_id}</code> đã bị hủy. Vui lòng tạo mã QR mới nếu cần."
             )
         except Exception:
             logging.exception("Không gửi được tin nhắn từ chối cho khách")
 
         await c.message.edit_text(
-            c.message.text + f"\n\n❌ Đã từ chối yêu cầu nạp {amount:,}đ"
+            c.message.text + f"\n\n❌ Đã hủy yêu cầu nạp order <code>{order_id}</code>"
         )
-        await c.answer("Đã từ chối.")
+        await c.answer("Đã hủy.")
 
 # --- XỬ LÝ OTP ---
 @dp.callback_query(F.data == "otp_list")
@@ -2010,6 +2158,7 @@ async def sepay_webhook_post(request: Request):
     if amount <= 0 or not content:
         return {"ok": True, "message": "ignored"}
 
+    expire_old_pending_orders()
     orders = get_pending_orders()
     matched = None
 
@@ -2028,6 +2177,18 @@ async def sepay_webhook_post(request: Request):
         )
         return {"ok": True, "message": "no match"}
 
+    if is_order_expired(matched):
+        mark_order_expired(int(matched["id"]))
+        try:
+            await bot.send_message(
+                matched["user_id"],
+                f"⏰ Đơn nạp <code>{matched['id']}</code> đã quá hạn {QR_EXPIRE_MINUTES} phút nên hệ thống không cộng tiền tự động.\n"
+                "Vui lòng tạo mã QR mới và chuyển khoản lại đúng đơn mới."
+            )
+        except Exception:
+            logging.exception("Không gửi được thông báo order hết hạn khi webhook tới")
+        return {"ok": True, "message": "order expired"}
+
     async with BALANCE_LOCK:
         updated = mark_order_paid(
             matched["id"],
@@ -2041,7 +2202,7 @@ async def sepay_webhook_post(request: Request):
         new_balance = update_balance(
             matched["user_id"],
             matched["amount"],
-            note=f"SePay auto nạp tiền - memo={matched['memo']} - txn={txn_id}"
+            note=f"SePay auto nạp tiền - order={matched['id']} - memo={matched['memo']} - txn={txn_id}"
         )
 
         commission_status, referrer_id, commission_amount, referrer_new_balance = apply_referral_commission_atomic(
@@ -2057,6 +2218,7 @@ async def sepay_webhook_post(request: Request):
         await bot.send_message(
             matched["user_id"],
             f"✅ Đã nhận tiền tự động.\n"
+            f"🧾 Order ID: <code>{matched['id']}</code>\n"
             f"💰 Số tiền: <b>{matched['amount']:,}đ</b>\n"
             f"📝 Mã nạp: <code>{matched['memo']}</code>\n"
             f"💳 Số dư mới: <b>{new_balance:,}đ</b>"
@@ -2068,6 +2230,7 @@ async def sepay_webhook_post(request: Request):
         await bot.send_message(
             ADMIN_ID,
             f"💸 <b>TỰ ĐỘNG DUYỆT NẠP TIỀN</b>\n"
+            f"🧾 Order ID: <code>{matched['id']}</code>\n"
             f"👤 User: <code>{matched['user_id']}</code>\n"
             f"💰 Số tiền: <b>{matched['amount']:,}đ</b>\n"
             f"📝 Memo: <code>{matched['memo']}</code>\n"
