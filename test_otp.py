@@ -1815,6 +1815,12 @@ async def admin_action_handler(c: CallbackQuery):
                 source=f"manual_admin_approve_order_{order_id}_by_{c.from_user.id}"
             )
 
+        commission_status = referral_result.get("status")
+        referrer_id = referral_result.get("referrer_id")
+        commission_amount = int(referral_result.get("commission_amount", 0) or 0)
+        first_bonus_amount = int(referral_result.get("first_bonus_amount", 0) or 0)
+        referrer_new_balance = int(referral_result.get("referrer_new_balance", 0) or 0)
+
         if new_balance is None:
             await c.message.edit_text(
                 c.message.text + f"\n\n❌ Duyệt thất bại: không cộng được tiền cho khách."
@@ -1831,7 +1837,7 @@ async def admin_action_handler(c: CallbackQuery):
         except Exception:
             logging.exception("Không gửi được tin nhắn cộng tiền cho khách")
 
-        if commission_status == "credited" and referrer_id and commission_amount > 0:
+        if commission_status == "credited" and referrer_id:
             try:
                 await bot.send_message(
                     referrer_id,
@@ -2264,6 +2270,12 @@ async def sepay_webhook_post(request: Request):
             deposit_amount=matched["amount"],
             source=f"sepay:{txn_id}"
         )
+
+    commission_status = referral_result.get("status")
+    referrer_id = referral_result.get("referrer_id")
+    commission_amount = int(referral_result.get("commission_amount", 0) or 0)
+    first_bonus_amount = int(referral_result.get("first_bonus_amount", 0) or 0)
+    referrer_new_balance = int(referral_result.get("referrer_new_balance", 0) or 0)
 
     if new_balance is None:
         return {"ok": False, "message": "balance update failed"}
