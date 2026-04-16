@@ -990,13 +990,46 @@ async def referral_menu_callback(c: CallbackQuery):
 async def admin_list_users(m: Message):
     if m.from_user.id != ADMIN_ID:
         return await m.answer("❌ Bạn không có quyền!")
-    users = db().execute("SELECT * FROM users").fetchall()
+
+    conn = db()
+    try:
+        users = conn.execute("""
+            SELECT * FROM users
+            ORDER BY user_id DESC
+        """).fetchall()
+    finally:
+        conn.close()
+
     if not users:
         return await m.answer("📭 Trống.")
-    lines = ["👥 <b>DANH SÁCH NGƯỜI DÙNG</b>\n"]
+
+    header = f"👥 <b>TỔNG SỐ NGƯỜI DÙNG:</b> <b>{len(users)}</b>\n\n"
+    chunks = []
+    current = header
+
     for i, u in enumerate(users, 1):
-        lines.append(f"{i}. {u['full_name']} (ID: <code>{u['user_id']}</code>) - <b>{u['balance']:,}đ</b>")
-    await m.answer("\n".join(lines))
+        full_name = html.escape(u["full_name"] or "Không rõ tên")
+        username = f"@{html.escape(u['username'])}" if u["username"] else "không username"
+        line = (
+            f"{i}. {full_name} | {username} | "
+            f"ID: <code>{u['user_id']}</code> | "
+            f"Số dư: <b>{int(u['balance']):,}đ</b>\n"
+        )
+
+        if len(current) + len(line) > 3500:
+            chunks.append(current)
+            current = line
+        else:
+            current += line
+
+    if current.strip():
+        chunks.append(current)
+
+    for idx, chunk in enumerate(chunks, 1):
+        if idx == 1:
+            await m.answer(chunk)
+        else:
+            await m.answer(f"<b>📄 Trang {idx}/{len(chunks)}</b>\n\n{chunk}")
 
 @dp.message(Command("backup"))
 async def admin_backup_db(m: Message):
