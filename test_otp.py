@@ -65,7 +65,7 @@ QR_PASTE_H = 270
 # --- REFERRAL ---
 REFERRAL_FIRST_BONUS = 3000
 REFERRAL_PERCENT = 0.10
-REFERRAL_MIN_DEPOSIT = 20000
+REFERRAL_MIN_DEPOSIT = 5000
 BOT_USERNAME_CACHE = None
 QR_EXPIRE_MINUTES = 30
 
@@ -615,10 +615,10 @@ def register_referral_atomic(referrer_id: int, invited_user):
 
 def apply_referral_commission_atomic(invited_user_id: int, deposit_amount: int, source: str = ""):
     """
-    Chống spam referral:
-    - Chỉ trả thưởng/hh khi người được giới thiệu nạp >= REFERRAL_MIN_DEPOSIT
-    - Thưởng người mới chỉ trả 1 lần duy nhất
-    - Hoa hồng 10% trả cho từng lần nạp đủ điều kiện
+    Logic referral đúng theo yêu cầu:
+    - Lần nạp đầu tiên của user được giới thiệu phải >= REFERRAL_MIN_DEPOSIT
+      => referrer nhận REFERRAL_FIRST_BONUS + 10% tiền nạp
+    - Từ lần nạp thứ 2 trở đi: nạp bao nhiêu cũng được, referrer luôn nhận 10%
     """
     if deposit_amount <= 0:
         return {
@@ -653,11 +653,12 @@ def apply_referral_commission_atomic(invited_user_id: int, deposit_amount: int, 
             }
 
         referrer_id = int(ref["referrer_id"])
+        is_first_qualified_reward = int(ref["first_bonus_paid"] or 0) == 0
 
-        if int(deposit_amount) < int(REFERRAL_MIN_DEPOSIT):
+        if is_first_qualified_reward and int(deposit_amount) < int(REFERRAL_MIN_DEPOSIT):
             conn.rollback()
             return {
-                "status": "deposit_not_enough",
+                "status": "first_deposit_not_enough",
                 "referrer_id": referrer_id,
                 "commission_amount": 0,
                 "first_bonus_amount": 0,
@@ -667,7 +668,7 @@ def apply_referral_commission_atomic(invited_user_id: int, deposit_amount: int, 
         commission = int(deposit_amount * REFERRAL_PERCENT)
         first_bonus_amount = 0
 
-        if int(ref["first_bonus_paid"] or 0) == 0:
+        if is_first_qualified_reward:
             first_bonus_amount = int(REFERRAL_FIRST_BONUS)
             cur.execute("""
                 UPDATE referrals
@@ -717,7 +718,7 @@ def apply_referral_commission_atomic(invited_user_id: int, deposit_amount: int, 
                 referrer_id,
                 first_bonus_amount,
                 new_balance,
-                f"Thưởng referral đạt ngưỡng nạp đầu tiên từ user {invited_user_id} nạp {deposit_amount}đ | source={source}"
+                f"Thưởng người mới referral từ user {invited_user_id} đạt lần nạp đầu tiên >= {REFERRAL_MIN_DEPOSIT}đ | nạp {deposit_amount}đ | source={source}"
             ))
 
         if commission > 0:
@@ -1046,8 +1047,9 @@ async def show_menu(m: Message):
             referral_notice = (
                 "\n\n🎉 Link giới thiệu hợp lệ."
                 "\nTài khoản của bạn đã được ghi nhận người giới thiệu."
-                f"\nNgười giới thiệu sẽ nhận thưởng khi bạn nạp từ <b>{REFERRAL_MIN_DEPOSIT:,}đ</b> trở lên."
-                f"\nKhi đạt điều kiện, họ sẽ nhận <b>{REFERRAL_FIRST_BONUS:,}đ</b> + <b>10%</b> hoa hồng."
+                f"\nNgười giới thiệu sẽ nhận thưởng khi lần nạp đầu tiên của bạn từ <b>{REFERRAL_MIN_DEPOSIT:,}đ</b> trở lên."
+                f"\nKhi đạt điều kiện lần đầu, họ sẽ nhận <b>{REFERRAL_FIRST_BONUS:,}đ</b> + <b>10%</b> hoa hồng."
+                "\nTừ các lần nạp sau, họ vẫn nhận <b>10%</b> dù bạn nạp bao nhiêu."
             )
 
             try:
@@ -1100,8 +1102,9 @@ async def help_command(m: Message):
         "\n"
         "<b>🎁 Referral</b>\n"
         "Bấm nút 'Giới thiệu bạn bè' trong menu để lấy link mời\n"
-        f"Người mới vào đúng link: bạn nhận ngay {REFERRAL_FIRST_BONUS:,}đ\n"
-        "Người được giới thiệu nạp tiền thành công, bạn nhận thêm 10% hoa hồng\n"
+        "Người mới vào đúng link sẽ được ghi nhận referral, chưa cộng tiền ngay\n"
+        f"Lần nạp đầu tiên của người được giới thiệu phải từ {REFERRAL_MIN_DEPOSIT:,}đ trở lên thì bạn mới nhận {REFERRAL_FIRST_BONUS:,}đ + 10%\n"
+        "Từ lần nạp thứ 2 trở đi, người đó nạp bao nhiêu cũng được và bạn vẫn nhận 10% hoa hồng\n"
         "\n"
         "<b>👑 Lệnh admin</b>\n"
         "/users - Xem danh sách user\n"
@@ -1141,8 +1144,9 @@ async def referral_menu_callback(c: CallbackQuery):
         f"🎉 Thưởng người mới: <b>{REFERRAL_FIRST_BONUS:,}đ</b>\n"
         "💰 Hoa hồng nạp tiền: <b>10% số tiền nạp</b>\n"
         "📌 Điều kiện: người được giới thiệu bấm đúng link của bạn và vào /start\n"
-        f"📌 Ngay khi ghi nhận thành công, bạn nhận <b>{REFERRAL_FIRST_BONUS:,}đ</b>\n"
-        "📌 Sau đó khi họ nạp tiền thành công, bạn tiếp tục nhận 10% hoa hồng\n"
+        f"📌 Lần nạp đầu tiên của người đó phải từ <b>{REFERRAL_MIN_DEPOSIT:,}đ</b> trở lên\n"
+        f"📌 Khi đạt điều kiện lần đầu, bạn nhận <b>{REFERRAL_FIRST_BONUS:,}đ</b> + <b>10%</b>\n"
+        "📌 Từ lần nạp thứ 2 trở đi, họ nạp bao nhiêu cũng được và bạn vẫn nhận <b>10%</b>\n"
         "📌 Mỗi tài khoản chỉ ghi nhận 1 người giới thiệu\n\n"
         f"👥 Tổng số người đã giới thiệu: <b>{total_invited}</b>\n"
         f"💵 Tổng thưởng + hoa hồng đã nhận: <b>{total_bonus:,}đ</b>\n\n"
@@ -1805,7 +1809,7 @@ async def admin_action_handler(c: CallbackQuery):
                 note=f"Duyệt nạp tiền thủ công order {order_id} số tiền {amount}đ bởi admin {c.from_user.id}"
             )
 
-            commission_status, referrer_id, commission_amount, referrer_new_balance = apply_referral_commission_atomic(
+            referral_result = apply_referral_commission_atomic(
                 invited_user_id=user_id,
                 deposit_amount=amount,
                 source=f"manual_admin_approve_order_{order_id}_by_{c.from_user.id}"
