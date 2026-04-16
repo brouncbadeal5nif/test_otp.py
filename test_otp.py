@@ -1042,23 +1042,24 @@ async def show_menu(m: Message):
                 invited_user=m.from_user
             )
 
-        if status == "registered":
+        if status == "registered_pending":
             referral_notice = (
                 "\n\n🎉 Link giới thiệu hợp lệ."
                 "\nTài khoản của bạn đã được ghi nhận người giới thiệu."
-                f"\nNgười giới thiệu đã được cộng ngay <b>{first_bonus:,}đ</b>."
-                "\nKhi bạn nạp tiền thành công, người giới thiệu sẽ tiếp tục nhận <b>10%</b> hoa hồng."
+                f"\nNgười giới thiệu sẽ nhận thưởng khi bạn nạp từ <b>{REFERRAL_MIN_DEPOSIT:,}đ</b> trở lên."
+                f"\nKhi đạt điều kiện, họ sẽ nhận <b>{REFERRAL_FIRST_BONUS:,}đ</b> + <b>10%</b> hoa hồng."
             )
 
             try:
                 await bot.send_message(
                     referrer_id,
-                    "🎁 <b>BẠN VỪA NHẬN THƯỞNG GIỚI THIỆU NGƯỜI MỚI</b>\n\n"
+                    "📌 <b>ĐÃ GHI NHẬN 1 REFERRAL MỚI</b>\n\n"
                     f"👤 Người dùng: <b>{html.escape(m.from_user.full_name)}</b>\n"
-                    f"🆔 ID: <code>{m.from_user.id}</code>\n"
-                    f"💰 Thưởng người mới: <b>{first_bonus:,}đ</b>\n"
-                    f"💳 Số dư mới: <b>{referrer_new_balance:,}đ</b>\n\n"
-                    "💡 Khi người này nạp tiền thành công, bạn còn nhận thêm <b>10%</b> hoa hồng."
+                    f"🆔 ID: <code>{m.from_user.id}</code>\n\n"
+                    f"⏳ Chưa cộng thưởng ngay.\n"
+                    f"Người này cần nạp từ <b>{REFERRAL_MIN_DEPOSIT:,}đ</b> trở lên để bạn nhận:\n"
+                    f"- Thưởng người mới: <b>{REFERRAL_FIRST_BONUS:,}đ</b>\n"
+                    "- Hoa hồng: <b>10%</b> tiền nạp"
                 )
             except Exception:
                 logging.exception("Không gửi được thông báo referral cho referrer")
@@ -1070,8 +1071,7 @@ async def show_menu(m: Message):
                     f"👤 Referrer ID: <code>{referrer_id}</code>\n"
                     f"👥 User mới: <b>{html.escape(m.from_user.full_name)}</b>\n"
                     f"🆔 Invited ID: <code>{m.from_user.id}</code>\n"
-                    f"🎁 Thưởng người mới: <b>{first_bonus:,}đ</b>\n"
-                    "💰 Cơ chế tiếp theo: <b>10% khi user nạp tiền thành công</b>"
+                    f"🛡 Chế độ chống spam: chỉ trả thưởng khi user nạp từ <b>{REFERRAL_MIN_DEPOSIT:,}đ</b> trở lên."
                 )
             except Exception:
                 logging.exception("Không gửi được thông báo referral cho admin")
