@@ -1663,7 +1663,7 @@ async def admin_set_user_balance(m: Message):
 # --- XỬ LÝ NẠP TIỀN ---
 @dp.callback_query(F.data == "deposit")
 async def deposit_start(c: CallbackQuery, state: FSMContext):
-    await c.message.answer("⌨️ Nhập số tiền muốn nạp:\nVí dụ: 10000")
+    await c.message.answer("⌨️ Nhập số tiền muốn nạp:\nVí dụ: 20000")
     await state.set_state(DepositState.waiting_for_amount)
     await c.answer()
 
