@@ -73,6 +73,7 @@ QR_EXPIRE_MINUTES = 30
 FIXED_APP_LIST = [
     {"Id": 1001, "Name": "Facebook"},
     {"Id": 1002, "Name": "Shopee/shopee pay"},
+    {"Id": 1006, "Name": "Telegram"},
     {"Id": 1005, "Name": "Gmail/Google"},
     {"Id": 1010, "Name": "Instagram"},
     {"Id": 1007, "Name": "Lazada"},
