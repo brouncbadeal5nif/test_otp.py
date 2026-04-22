@@ -32,6 +32,7 @@ BOT_TOKEN = "8762970436:AAHpz95Ua00kER-R7eLIij9lm1XGyR7nRDM"
 ADMIN_ID = 7078570432
 OTP_API_KEY = "8fc8e078133cde11"
 OTP_BASE_URL = "https://chaycodeso3.com/api"
+FIREBASE_DB_URL = "https://accstore-47e37-default-rtdb.asia-southeast1.firebasedatabase.app"
 
 BANK_BIN = "970422"
 BANK_ACCOUNT = "346641789567"
@@ -2195,6 +2196,59 @@ def _extract_amount_content_txn(payload):
 
     return amount, content, txn_id
 
+# --- FIREBASE WEB INTEGRATION ---
+async def process_firebase_deposit(amount: int, normalized_content: str, txn_id: str) -> bool:
+    try:
+        res = await HTTP_CLIENT.get(f"{FIREBASE_DB_URL}/deposit_requests.json")
+        if res.status_code != 200:
+            return False
+        
+        requests = res.json()
+        if not requests:
+            return False
+
+        for memo, req in requests.items():
+            if req.get("status") == "Chờ duyệt":
+                norm_memo = normalize_payment_text(memo)
+                req_amount = int(req.get("amount", 0))
+                
+                # Khớp memo và số tiền
+                if norm_memo in normalized_content and req_amount == amount:
+                    username = req.get("username")
+                    
+                    # 1. Cập nhật trạng thái đơn nạp Web
+                    await HTTP_CLIENT.patch(
+                        f"{FIREBASE_DB_URL}/deposit_requests/{memo}.json",
+                        json={"status": "Đã duyệt (Auto SePay)"}
+                    )
+                    
+                    # 2. Lấy số dư hiện tại
+                    user_res = await HTTP_CLIENT.get(f"{FIREBASE_DB_URL}/users/{username}/balance.json")
+                    current_balance = user_res.json() or 0
+                    
+                    # 3. Cộng tiền
+                    new_balance = current_balance + amount
+                    await HTTP_CLIENT.put(f"{FIREBASE_DB_URL}/users/{username}/balance.json", json=new_balance)
+                    
+                    # 4. Thông báo cho Admin qua Telegram
+                    try:
+                        await bot.send_message(
+                            ADMIN_ID,
+                            f"🌐 <b>WEB: TỰ ĐỘNG DUYỆT NẠP TIỀN</b>\n"
+                            f"👤 User Web: <code>{username}</code>\n"
+                            f"💰 Số tiền: <b>{amount:,}đ</b>\n"
+                            f"📝 Memo: <code>{memo}</code>\n"
+                            f"💳 Số dư mới: <b>{new_balance:,}đ</b>\n"
+                            f"🏦 Txn: <code>{html.escape(txn_id or 'N/A')}</code>"
+                        )
+                    except Exception:
+                        logging.exception("Không gửi được thông báo Firebase Deposit cho admin")
+                    
+                    return True
+    except Exception as e:
+        logging.error(f"Error processing Firebase deposit: {e}")
+    return False
+
 @app.get("/")
 async def root():
     return {"ok": True, "message": "Bot + SePay webhook is running"}
@@ -2233,6 +2287,11 @@ async def sepay_webhook_post(request: Request):
             break
 
     if not matched:
+        # Thử tìm đơn nạp bên phía Web App qua Firebase
+        web_matched = await process_firebase_deposit(amount, normalized_content, txn_id)
+        if web_matched:
+            return {"ok": True, "message": "processed for web"}
+
         logging.info(
             f"SEPAY no match | amount={amount} | content={content} | normalized={normalized_content}"
         )
