@@ -112,41 +112,56 @@ function renderServices(filter = '') {
     });
 }
 
-// Xác nhận thuê số
-function confirmRent(service) {
-    if (currentSessionId) {
-        tg.showConfirm('Bạn đang có 1 số chưa lấy xong mã. Hủy số cũ để thuê mới?', (confirmed) => {
-            if (confirmed) {
-                cancelSession();
-                rentNumber(service);
-            }
-        });
-        return;
-    }
+let activeSessions = [];
+let selectedService = null;
 
-    tg.showConfirm(`Bạn muốn thuê số cho ${service.Name} với giá ${service.Cost.toLocaleString('vi-VN')}đ?`, (confirmed) => {
-        if (confirmed) rentNumber(service);
-    });
+// Xác nhận thuê số (Mở Modal chọn mạng)
+function confirmRent(service) {
+    selectedService = service;
+    document.getElementById('modal-service-name').textContent = service.Name;
+    document.getElementById('modal-service-price').textContent = `${service.Cost.toLocaleString('vi-VN')}đ`;
+    document.getElementById('carrier-modal').classList.remove('hidden');
+}
+
+function closeCarrierModal() {
+    document.getElementById('carrier-modal').classList.add('hidden');
+    selectedService = null;
+}
+
+// Bấm chọn mạng và Thuê
+function submitRent(carrier) {
+    if (!selectedService) return;
+    closeCarrierModal();
+    rentNumber(selectedService, carrier);
 }
 
 // Gọi API thuê số
-async function rentNumber(service) {
+async function rentNumber(service, carrier) {
     tg.MainButton.showProgress();
     try {
+        const payload = { 
+            app_id: service.Id, 
+            app_name: service.Name, 
+            cost: service.Cost,
+            carrier: carrier
+        };
+        
         const res = await fetch(`${API_BASE}/rent`, {
             method: 'POST',
             headers: { 
                 'Content-Type': 'application/json',
                 'X-TG-INIT-DATA': tg.initData 
             },
-            body: JSON.stringify({ app_id: service.Id, app_name: service.Name, cost: service.Cost })
+            body: JSON.stringify(payload)
         });
         const data = await res.json();
         tg.MainButton.hideProgress();
 
         if (data.ok) {
-            showActiveSession(service.Name, data.number, data.request_id);
-            fetchUserInfo(); // Cập nhật lại số dư bị trừ
+            showToast('Thành công! Hãy kiểm tra tin nhắn Bot.');
+            setTimeout(() => {
+                tg.close();
+            }, 1500);
         } else {
             tg.showAlert(data.message || 'Không thể thuê số lúc này');
         }
@@ -156,84 +171,13 @@ async function rentNumber(service) {
     }
 }
 
-// Hiển thị khu vực Session
-function showActiveSession(serviceName, phone, reqId) {
-    currentSessionId = reqId;
-    
-    document.getElementById('active-session').classList.remove('hidden');
-    document.getElementById('active-service-name').textContent = serviceName;
-    document.getElementById('phone-value').textContent = phone;
-    
-    // Reset OTP UI
-    document.getElementById('otp-display').classList.add('hidden');
-    document.getElementById('otp-value').textContent = '------';
-    document.getElementById('otp-indicator').className = 'status-indicator waiting';
-    document.getElementById('otp-text').textContent = 'Đang chờ tin nhắn...';
-    
-    // Cuộn xuống cuối
-    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
-
-    // Bắt đầu Polling
-    startPolling(reqId);
-}
-
-// Polling kiểm tra mã OTP
-function startPolling(reqId) {
-    if (pollInterval) clearInterval(pollInterval);
-    
-    pollInterval = setInterval(async () => {
-        try {
-            const res = await fetch(`${API_BASE}/status/${reqId}`, {
-                headers: { 'X-TG-INIT-DATA': tg.initData }
-            });
-            const data = await res.json();
-            
-            if (data.ok && data.status === 'completed') {
-                clearInterval(pollInterval);
-                pollInterval = null;
-                currentSessionId = null; // Hoàn tất
-                
-                // Hiển thị mã
-                document.getElementById('otp-indicator').className = 'status-indicator success';
-                document.getElementById('otp-text').textContent = 'Đã có mã xác nhận!';
-                document.getElementById('otp-display').classList.remove('hidden');
-                document.getElementById('otp-value').textContent = data.code;
-                
-                tg.HapticFeedback.notificationOccurred('success');
-            } else if (!data.ok || data.status === 'cancelled') {
-                clearInterval(pollInterval);
-                pollInterval = null;
-                currentSessionId = null;
-                document.getElementById('otp-indicator').className = 'status-indicator';
-                document.getElementById('otp-indicator').style.backgroundColor = 'var(--danger-color)';
-                document.getElementById('otp-text').textContent = 'Số bị hủy hoặc lỗi mạng.';
-                fetchUserInfo(); // Hoàn tiền
-            }
-        } catch (err) {
-            console.error(err);
-        }
-    }, 5000); // Check mỗi 5s
-}
-
-// Hủy Session
-function cancelSession() {
-    if (!currentSessionId) return;
-    
-    // Gọi API hủy số nếu hệ thống hỗ trợ, tạm thời chỉ ẩn giao diện
-    clearInterval(pollInterval);
-    pollInterval = null;
-    currentSessionId = null;
-    
-    document.getElementById('active-session').classList.add('hidden');
-    showToast('Đã hủy chờ số');
-}
-
 // Copy to Clipboard
 function copyToClipboard(elementId, typeName) {
-    const text = document.getElementById(elementId).textContent;
+    const el = document.getElementById(elementId);
+    if (!el) return;
+    const text = el.textContent;
     if (text === '------' || text === 'Đang lấy số...') return;
 
-    // Use fallback copy logic as navigator.clipboard might be restricted in some TG clients
     const textarea = document.createElement('textarea');
     textarea.value = text;
     document.body.appendChild(textarea);
