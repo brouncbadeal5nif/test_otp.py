@@ -7,6 +7,7 @@ import hmac
 import hashlib
 import json
 import urllib.parse
+import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -2435,6 +2436,49 @@ def check_telegram_auth(init_data: str) -> dict:
         pass
     return None
 
+async def poll_otp_task(user_id: int, request_id: int, app_name: str, number: str, cost: int, message_to_edit: Message = None):
+    start_time = time.time()
+    while time.time() - start_time < 300: # 5 phút
+        res = await otp_api.get_otp_code(request_id)
+        if res.get("ResponseCode") == 0:
+            code = res.get("Result", {}).get("Code")
+            if code:
+                text = (
+                    f"✅ <b>CÓ MÃ XÁC NHẬN!</b>\n\n"
+                    f"📱 Dịch vụ: <b>{app_name}</b>\n"
+                    f"📞 Số điện thoại: <code>{number}</code>\n"
+                    f"💬 Mã OTP: <code>{code}</code>\n"
+                )
+                if message_to_edit:
+                    try:
+                        await message_to_edit.edit_text(text)
+                    except Exception:
+                        await bot.send_message(user_id, text)
+                else:
+                    await bot.send_message(user_id, text)
+                return
+        
+        await asyncio.sleep(5)
+    
+    # Hết hạn
+    is_admin = (user_id == ADMIN_ID)
+    if not is_admin:
+        async with BALANCE_LOCK:
+            update_balance(user_id, cost, note=f"Hoàn tiền do hết hạn lấy số: {app_name}")
+            
+    text_fail = (
+        f"❌ <b>HẾT HẠN HOẶC LỖI!</b>\n"
+        f"📱 Dịch vụ: {app_name} ({number})\n"
+        f"💰 Đã hoàn lại: {cost}đ" if not is_admin else f"❌ <b>HẾT HẠN HOẶC LỖI!</b>\n📱 Dịch vụ: {app_name} ({number})\n💰 Dịch vụ Admin"
+    )
+    if message_to_edit:
+        try:
+            await message_to_edit.edit_text(text_fail)
+        except Exception:
+            await bot.send_message(user_id, text_fail)
+    else:
+        await bot.send_message(user_id, text_fail)
+
 async def get_tg_user(x_tg_init_data: str = Header(None)):
     if not x_tg_init_data:
         raise HTTPException(status_code=401, detail="Missing init data")
@@ -2474,7 +2518,25 @@ async def mini_rent(req: RentRequest, tg_user: dict = Depends(get_tg_user)):
     if res.get("ResponseCode") == 0:
         raw_num = str(res["Result"]["Number"])
         normalized_num = normalize_phone_vn(raw_num)
-        return {"ok": True, "number": normalized_num, "request_id": res["Result"]["Id"]}
+        request_id = res["Result"]["Id"]
+        
+        # Send initial message to user
+        try:
+            msg = await bot.send_message(
+                user_id,
+                f"⏳ <b>ĐANG CHỜ MÃ OTP</b>\n\n"
+                f"📱 Dịch vụ: <b>{req.app_name}</b>\n"
+                f"📞 Số điện thoại: <code>{normalized_num}</code>\n\n"
+                f"<i>Vui lòng chờ, mã sẽ tự động cập nhật tại tin nhắn này...</i>"
+            )
+            # Spawn background task to poll
+            asyncio.create_task(poll_otp_task(user_id, request_id, req.app_name, normalized_num, req.cost, msg))
+        except Exception as e:
+            logging.error(f"Failed to send initial OTP message: {e}")
+            # Still spawn task, but without msg to edit
+            asyncio.create_task(poll_otp_task(user_id, request_id, req.app_name, normalized_num, req.cost, None))
+            
+        return {"ok": True, "number": normalized_num, "request_id": request_id}
 
     if not is_admin:
         async with BALANCE_LOCK:
