@@ -911,7 +911,7 @@ async def build_qr_on_paper_image(qr_url: str) -> BufferedInputFile:
         filename="qr_thanh_toan.png"
     )
 
-async def get_fixed_apps_from_api():
+async def get_fixed_apps_from_api(user_id: int = 0):
     res = await otp_api.get_apps()
     if res.get("ResponseCode") != 0:
         return res
@@ -924,10 +924,17 @@ async def get_fixed_apps_from_api():
         app_id = int(item["Id"])
         if app_id in api_map:
             api_item = api_map[app_id]
+            original_cost = float(api_item.get("Cost", 0))
+            
+            if user_id == ADMIN_ID:
+                final_cost = 0
+            else:
+                final_cost = int(original_cost * 3000)
+                
             filtered_apps.append({
                 "Id": app_id,
                 "Name": item["Name"],
-                "Cost": api_item.get("Cost", 0)
+                "Cost": final_cost
             })
 
     return {
@@ -2443,7 +2450,8 @@ async def mini_me(tg_user: dict = Depends(get_tg_user)):
 
 @app.get("/api/mini/services")
 async def mini_services(tg_user: dict = Depends(get_tg_user)):
-    res = await get_fixed_apps_from_api()
+    user_id = tg_user.get("id")
+    res = await get_fixed_apps_from_api(user_id)
     if res.get("ResponseCode") == 0:
         return {"ok": True, "services": res["Result"]}
     return {"ok": False, "message": "Lỗi lấy danh sách dịch vụ"}
@@ -2451,18 +2459,23 @@ async def mini_services(tg_user: dict = Depends(get_tg_user)):
 @app.post("/api/mini/rent")
 async def mini_rent(req: RentRequest, tg_user: dict = Depends(get_tg_user)):
     user_id = tg_user.get("id")
+    is_admin = (user_id == ADMIN_ID)
+    
     async with BALANCE_LOCK:
         balance = get_balance(user_id)
-        if balance < req.cost:
+        if not is_admin and balance < req.cost:
             return {"ok": False, "message": "Số dư không đủ. Vui lòng nạp thêm!"}
-        update_balance(user_id, -req.cost, note=f"Thuê OTP Mini App: {req.app_name}")
+            
+        if not is_admin:
+            update_balance(user_id, -req.cost, note=f"Thuê OTP Mini App: {req.app_name}")
 
     res = await otp_api.request_number(req.app_id)
     if res.get("ResponseCode") == 0:
         return {"ok": True, "number": res["Result"]["Number"], "request_id": res["Result"]["Id"]}
 
-    async with BALANCE_LOCK:
-        update_balance(user_id, req.cost, note=f"Hoàn tiền do lỗi lấy số: {req.app_name}")
+    if not is_admin:
+        async with BALANCE_LOCK:
+            update_balance(user_id, req.cost, note=f"Hoàn tiền do lỗi lấy số: {req.app_name}")
 
     return {"ok": False, "message": res.get("Msg", "Lỗi lấy số từ API gốc")}
 
