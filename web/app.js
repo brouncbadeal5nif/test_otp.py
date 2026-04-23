@@ -142,9 +142,11 @@ async function rentNumber(service, carrier) {
         const payload = { 
             app_id: service.Id, 
             app_name: service.Name, 
-            cost: service.Cost,
-            carrier: carrier
+            cost: service.Cost
         };
+        if (carrier) {
+            payload.carrier = carrier;
+        }
         
         const res = await fetch(`${API_BASE}/rent`, {
             method: 'POST',
