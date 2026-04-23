@@ -43,26 +43,21 @@
             <!-- Services will be injected here via JS -->
         </main>
 
-        <!-- Active Session Footer (Hidden by default) -->
-        <div id="active-session" class="active-session hidden glass-panel">
-            <div class="session-header">
-                <span class="service-name" id="active-service-name">Dịch Vụ</span>
-                <button class="btn-cancel" id="btn-cancel-session"><i class="fa-solid fa-times"></i> Hủy</button>
-            </div>
-            
-            <div class="phone-display" id="phone-display" onclick="copyToClipboard('phone-value', 'Số điện thoại')">
-                <div class="phone-number" id="phone-value">Đang lấy số...</div>
-                <i class="fa-regular fa-copy copy-icon"></i>
-            </div>
-
-            <div class="otp-status">
-                <div class="status-indicator waiting" id="otp-indicator"></div>
-                <span id="otp-text">Đang chờ tin nhắn...</span>
-            </div>
-
-            <div class="otp-display hidden" id="otp-display" onclick="copyToClipboard('otp-value', 'Mã OTP')">
-                <div class="otp-code" id="otp-value">------</div>
-                <i class="fa-regular fa-copy copy-icon"></i>
+        <!-- Carrier Selection Modal -->
+        <div id="carrier-modal" class="modal hidden">
+            <div class="modal-content glass-panel">
+                <h3 id="modal-service-name">Chọn nhà mạng</h3>
+                <p id="modal-service-price" class="modal-price">---</p>
+                
+                <div class="carrier-grid">
+                    <button class="btn-carrier" onclick="submitRent(null)">Ngẫu nhiên</button>
+                    <button class="btn-carrier" onclick="submitRent('Viettel')">Viettel</button>
+                    <button class="btn-carrier" onclick="submitRent('Vinaphone')">Vinaphone</button>
+                    <button class="btn-carrier" onclick="submitRent('Mobifone')">Mobifone</button>
+                    <button class="btn-carrier" onclick="submitRent('Vietnamobile')">Vietnamobile</button>
+                </div>
+                
+                <button class="btn-close-modal" onclick="closeCarrierModal()">Đóng</button>
             </div>
         </div>
 

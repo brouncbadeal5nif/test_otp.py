@@ -24,9 +24,6 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('search-input').addEventListener('input', (e) => {
         renderServices(e.target.value);
     });
-
-    // Event listener cho nút Hủy
-    document.getElementById('btn-cancel-session').addEventListener('click', cancelSession);
 });
 
 // Fetch thông tin user (Số dư)
