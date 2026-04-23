@@ -49,6 +49,8 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_NAME = str(BASE_DIR / "shop_bot.db")
 PORT = int(os.getenv("PORT", "8000"))
 WEBAPP_URL = os.getenv("WEBAPP_URL", "https://thueotp-production.up.railway.app/app")
+if not WEBAPP_URL.startswith("http"):
+    WEBAPP_URL = "https://" + WEBAPP_URL
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
