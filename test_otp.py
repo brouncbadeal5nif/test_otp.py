@@ -2527,6 +2527,7 @@ async def mini_rent(req: RentRequest, tg_user: dict = Depends(get_tg_user)):
                 f"⏳ <b>ĐANG CHỜ MÃ OTP</b>\n\n"
                 f"📱 Dịch vụ: <b>{req.app_name}</b>\n"
                 f"📞 Số điện thoại: <code>{normalized_num}</code>\n\n"
+                f"{DEFAULT_NOTE}\n\n"
                 f"<i>Vui lòng chờ, mã sẽ tự động cập nhật tại tin nhắn này...</i>"
             )
             # Spawn background task to poll
