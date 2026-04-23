@@ -2415,6 +2415,7 @@ class RentRequest(BaseModel):
     app_id: int
     app_name: str
     cost: int
+    carrier: str = None
 
 def check_telegram_auth(init_data: str) -> dict:
     try:
@@ -2469,9 +2470,11 @@ async def mini_rent(req: RentRequest, tg_user: dict = Depends(get_tg_user)):
         if not is_admin:
             update_balance(user_id, -req.cost, note=f"Thuê OTP Mini App: {req.app_name}")
 
-    res = await otp_api.request_number(req.app_id)
+    res = await otp_api.request_number(req.app_id, carrier=req.carrier)
     if res.get("ResponseCode") == 0:
-        return {"ok": True, "number": res["Result"]["Number"], "request_id": res["Result"]["Id"]}
+        raw_num = str(res["Result"]["Number"])
+        normalized_num = normalize_phone_vn(raw_num)
+        return {"ok": True, "number": normalized_num, "request_id": res["Result"]["Id"]}
 
     if not is_admin:
         async with BALANCE_LOCK:
