@@ -3,11 +3,6 @@ import logging
 import sqlite3
 import html
 import os
-import hmac
-import hashlib
-import json
-import urllib.parse
-import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -15,9 +10,7 @@ from io import BytesIO
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Request, Header, HTTPException, Depends
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from fastapi import FastAPI, Request
 from PIL import Image
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -31,8 +24,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
     BufferedInputFile,
-    FSInputFile,
-    WebAppInfo
+    FSInputFile
 )
 
 # --- CẤU HÌNH ---
@@ -49,9 +41,6 @@ ACCOUNT_NAME = "VU VAN CUONG"
 BASE_DIR = Path(__file__).resolve().parent
 DB_NAME = str(BASE_DIR / "shop_bot.db")
 PORT = int(os.getenv("PORT", "8000"))
-WEBAPP_URL = os.getenv("WEBAPP_URL", "https://thueotp-production.up.railway.app/app")
-if not WEBAPP_URL.startswith("http"):
-    WEBAPP_URL = "https://" + WEBAPP_URL
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -912,7 +901,7 @@ async def build_qr_on_paper_image(qr_url: str) -> BufferedInputFile:
         filename="qr_thanh_toan.png"
     )
 
-async def get_fixed_apps_from_api(user_id: int = 0):
+async def get_fixed_apps_from_api():
     res = await otp_api.get_apps()
     if res.get("ResponseCode") != 0:
         return res
@@ -925,17 +914,10 @@ async def get_fixed_apps_from_api(user_id: int = 0):
         app_id = int(item["Id"])
         if app_id in api_map:
             api_item = api_map[app_id]
-            original_cost = float(api_item.get("Cost", 0))
-            
-            if user_id == ADMIN_ID:
-                final_cost = 0
-            else:
-                final_cost = int(original_cost * 3000)
-                
             filtered_apps.append({
                 "Id": app_id,
                 "Name": item["Name"],
-                "Cost": final_cost
+                "Cost": api_item.get("Cost", 0)
             })
 
     return {
@@ -1035,7 +1017,7 @@ def main_menu_keyboard(user_id):
 
     rows = [
         [InlineKeyboardButton(text=f"💰 Số dư: {bal_text}", callback_data="refresh_bal")],
-        [InlineKeyboardButton(text="📱 Thuê số OTP (Mini App)", web_app=WebAppInfo(url=WEBAPP_URL))],
+        [InlineKeyboardButton(text="📱 Thuê số OTP", callback_data="otp_list")],
         [InlineKeyboardButton(text="🎁 Giới thiệu bạn bè", callback_data="referral_menu")],
         [
             InlineKeyboardButton(text="💳 Nạp tiền", callback_data="deposit"),
@@ -2411,165 +2393,12 @@ async def sepay_webhook_post(request: Request):
 
     return {"ok": True, "message": "processed"}
 
-# --- TELEGRAM WEBAPP API ---
-class RentRequest(BaseModel):
-    app_id: int
-    app_name: str
-    cost: int
-    carrier: str = None
-
-def check_telegram_auth(init_data: str) -> dict:
-    try:
-        parsed_data = urllib.parse.parse_qsl(init_data)
-        data_dict = {k: v for k, v in parsed_data}
-        hash_val = data_dict.pop('hash', None)
-        if not hash_val: return None
-
-        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(data_dict.items()))
-        secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
-        expected_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
-
-        if expected_hash == hash_val:
-            user_data = json.loads(data_dict.get('user', '{}'))
-            return user_data
-    except Exception:
-        pass
-    return None
-
-async def poll_otp_task(user_id: int, request_id: int, app_name: str, number: str, cost: int, message_to_edit: Message = None):
-    start_time = time.time()
-    while time.time() - start_time < 300: # 5 phút
-        res = await otp_api.get_otp_code(request_id)
-        if res.get("ResponseCode") == 0:
-            code = res.get("Result", {}).get("Code")
-            if code:
-                text = (
-                    f"✅ <b>CÓ MÃ XÁC NHẬN!</b>\n\n"
-                    f"📱 Dịch vụ: <b>{app_name}</b>\n"
-                    f"📞 Số điện thoại: <code>{number}</code>\n"
-                    f"💬 Mã OTP: <code>{code}</code>\n"
-                )
-                if message_to_edit:
-                    try:
-                        await message_to_edit.edit_text(text)
-                    except Exception:
-                        await bot.send_message(user_id, text)
-                else:
-                    await bot.send_message(user_id, text)
-                return
-        
-        await asyncio.sleep(5)
-    
-    # Hết hạn
-    is_admin = (user_id == ADMIN_ID)
-    if not is_admin:
-        async with BALANCE_LOCK:
-            update_balance(user_id, cost, note=f"Hoàn tiền do hết hạn lấy số: {app_name}")
-            
-    text_fail = (
-        f"❌ <b>HẾT HẠN HOẶC LỖI!</b>\n"
-        f"📱 Dịch vụ: {app_name} ({number})\n"
-        f"💰 Đã hoàn lại: {cost}đ" if not is_admin else f"❌ <b>HẾT HẠN HOẶC LỖI!</b>\n📱 Dịch vụ: {app_name} ({number})\n💰 Dịch vụ Admin"
-    )
-    if message_to_edit:
-        try:
-            await message_to_edit.edit_text(text_fail)
-        except Exception:
-            await bot.send_message(user_id, text_fail)
-    else:
-        await bot.send_message(user_id, text_fail)
-
-async def get_tg_user(x_tg_init_data: str = Header(None)):
-    if not x_tg_init_data:
-        raise HTTPException(status_code=401, detail="Missing init data")
-    user = check_telegram_auth(x_tg_init_data)
-    if not user:
-        raise HTTPException(status_code=403, detail="Invalid init data")
-    return user
-
-@app.get("/api/mini/me")
-async def mini_me(tg_user: dict = Depends(get_tg_user)):
-    user_id = tg_user.get("id")
-    balance = get_balance(user_id)
-    return {"ok": True, "balance": balance}
-
-@app.get("/api/mini/services")
-async def mini_services(tg_user: dict = Depends(get_tg_user)):
-    user_id = tg_user.get("id")
-    res = await get_fixed_apps_from_api(user_id)
-    if res.get("ResponseCode") == 0:
-        return {"ok": True, "services": res["Result"]}
-    return {"ok": False, "message": "Lỗi lấy danh sách dịch vụ"}
-
-@app.post("/api/mini/rent")
-async def mini_rent(req: RentRequest, tg_user: dict = Depends(get_tg_user)):
-    user_id = tg_user.get("id")
-    is_admin = (user_id == ADMIN_ID)
-    
-    async with BALANCE_LOCK:
-        balance = get_balance(user_id)
-        if not is_admin and balance < req.cost:
-            return {"ok": False, "message": "Số dư không đủ. Vui lòng nạp thêm!"}
-            
-        if not is_admin:
-            update_balance(user_id, -req.cost, note=f"Thuê OTP Mini App: {req.app_name}")
-
-    res = await otp_api.request_number(req.app_id, carrier=req.carrier)
-    if res.get("ResponseCode") == 0:
-        raw_num = str(res["Result"]["Number"])
-        normalized_num = normalize_phone_vn(raw_num)
-        request_id = res["Result"]["Id"]
-        
-        # Send initial message to user
-        try:
-            msg = await bot.send_message(
-                user_id,
-                f"⏳ <b>ĐANG CHỜ MÃ OTP</b>\n\n"
-                f"📱 Dịch vụ: <b>{req.app_name}</b>\n"
-                f"📞 Số điện thoại: <code>{normalized_num}</code>\n\n"
-                f"{DEFAULT_NOTE}\n\n"
-                f"<i>Vui lòng chờ, mã sẽ tự động cập nhật tại tin nhắn này...</i>"
-            )
-            # Spawn background task to poll
-            asyncio.create_task(poll_otp_task(user_id, request_id, req.app_name, normalized_num, req.cost, msg))
-        except Exception as e:
-            logging.error(f"Failed to send initial OTP message: {e}")
-            # Still spawn task, but without msg to edit
-            asyncio.create_task(poll_otp_task(user_id, request_id, req.app_name, normalized_num, req.cost, None))
-            
-        return {"ok": True, "number": normalized_num, "request_id": request_id}
-
-    if not is_admin:
-        async with BALANCE_LOCK:
-            update_balance(user_id, req.cost, note=f"Hoàn tiền do lỗi lấy số: {req.app_name}")
-
-    return {"ok": False, "message": res.get("Msg", "Lỗi lấy số từ API gốc")}
-
-@app.get("/api/mini/status/{req_id}")
-async def mini_status(req_id: int, tg_user: dict = Depends(get_tg_user)):
-    res = await otp_api.get_otp_code(req_id)
-    if res.get("ResponseCode") == 0:
-        code = res.get("Result", {}).get("Code")
-        if code:
-            return {"ok": True, "status": "completed", "code": code}
-        return {"ok": True, "status": "waiting"}
-    return {"ok": False, "status": "cancelled"}
-
-app.mount("/app", StaticFiles(directory=str(BASE_DIR / "web"), html=True), name="web")
-
 # --- RUN ---
 async def run_bot():
     await dp.start_polling(bot)
 
 async def run_web():
-    config = uvicorn.Config(
-        app, 
-        host="0.0.0.0", 
-        port=PORT, 
-        log_level="info",
-        proxy_headers=True,
-        forwarded_allow_ips="*"
-    )
+    config = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info")
     server = uvicorn.Server(config)
     await server.serve()
 
