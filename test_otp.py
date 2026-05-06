@@ -28,7 +28,7 @@ from aiogram.types import (
 )
 
 # --- CẤU HÌNH ---
-BOT_TOKEN = "8762970436:AAHpz95Ua00kER-R7eLIij9lm1XGyR7nRDM"
+BOT_TOKEN = "8762970436:AAHpz95Ua00kER-R7eLIij9lm1XGyR7nRD"
 ADMIN_ID = 7078570432
 OTP_API_KEY = "8fc8e078133cde11"
 OTP_BASE_URL = "https://chaycodeso3.com/api"
